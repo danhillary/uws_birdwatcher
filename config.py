@@ -1,8 +1,16 @@
 """Central configuration. Override any value with an environment variable."""
+import datetime
 import os
+from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
 
 # Where the project lives, so paths work regardless of the current directory.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Load a local .env if present (no-op in the cloud, where vars come from the
+# host). Looks for .env next to this file regardless of current directory.
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 # Location — used by BirdNET to filter to species likely near you.
 # Default: Upper West Side, Manhattan.
@@ -41,3 +49,52 @@ CLIP_PADDING_SECONDS = float(os.environ.get("BW_CLIP_PADDING", "1.0"))
 # Storage cap for the clips directory, in megabytes. When exceeded, the oldest
 # clips are deleted (detection rows are always kept). 0 disables pruning.
 MAX_CLIPS_MB = int(os.environ.get("BW_MAX_CLIPS_MB", "2000"))
+
+# --- Timezone (Phase 5) --------------------------------------------------
+
+# Detections are stored as timezone-naive *local* timestamps so that "today"
+# and per-hour buckets are correct no matter where the dashboard runs (Posit
+# Connect Cloud is likely UTC). Default to NYC; override for another location.
+TIMEZONE = os.environ.get("BW_TIMEZONE", "America/New_York")
+_TZ = ZoneInfo(TIMEZONE)
+
+
+def now_local():
+    """Current wall-clock time in TIMEZONE, as a *naive* datetime.
+
+    We strip tzinfo so it round-trips cleanly through a Postgres TIMESTAMP
+    (without time zone) column and compares correctly against today_local()."""
+    return datetime.datetime.now(_TZ).replace(tzinfo=None)
+
+
+def today_local():
+    """Today's date in TIMEZONE (a datetime.date)."""
+    return datetime.datetime.now(_TZ).date()
+
+
+# --- Database (Phase 5) --------------------------------------------------
+
+# Postgres connection. Either provide a full SQLAlchemy URL via
+# BW_DATABASE_URL, or the individual DB_* parts (matching the ceqr pattern).
+# Credentials come from the environment / .env only — never commit them.
+DATABASE_URL = os.environ.get("BW_DATABASE_URL")
+
+DB_HOST = os.environ.get("DB_HOST", "localhost")
+DB_PORT = os.environ.get("DB_PORT", "5432")
+DB_NAME = os.environ.get("DB_NAME", "ceqr")
+DB_USER = os.environ.get("DB_USER", "")
+DB_PASS = os.environ.get("DB_PASS", "")
+
+# Schema that holds the birdwatcher tables, isolated from any other app
+# sharing the database (e.g. CEQR lives in its own schema).
+DB_SCHEMA = os.environ.get("BW_DB_SCHEMA", "birdwatcher")
+
+
+def database_url():
+    """SQLAlchemy URL for the Postgres database (psycopg2 driver)."""
+    if DATABASE_URL:
+        return DATABASE_URL
+    auth = DB_USER
+    if DB_PASS:
+        auth = f"{DB_USER}:{DB_PASS}"
+    return f"postgresql+psycopg2://{auth}@{DB_HOST}:{DB_PORT}/{DB_NAME}"

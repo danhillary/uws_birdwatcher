@@ -8,7 +8,6 @@ under the configured storage cap.
 Run with:  python -m capture.listen
 Stop with: Ctrl-C
 """
-import datetime
 import sys
 
 import numpy as np
@@ -81,14 +80,13 @@ def main():
 
     print("Loading BirdNET model (first run downloads/initialises, ~10-20s)...")
     analyzer = BirdAnalyzer()
-    conn = db.get_conn()
 
     print(
         f"Listening on '{info['name']}' "
         f"@ {config.SAMPLE_RATE} Hz, {config.SEGMENT_SECONDS}s segments.\n"
         f"Location: {config.LATITUDE}, {config.LONGITUDE} | "
         f"min confidence: {config.MIN_CONFIDENCE}\n"
-        f"Saving to: {config.DB_PATH}\n"
+        f"Saving to: {config.DB_HOST}/{config.DB_NAME} (schema {config.DB_SCHEMA})\n"
         f"Press Ctrl-C to stop.\n"
     )
 
@@ -98,10 +96,10 @@ def main():
 
             peak = float(np.max(np.abs(audio))) if audio.size else 0.0
             if peak < 1e-4:
-                print(f"[{datetime.datetime.now():%H:%M:%S}] (silence — check the mic)")
+                print(f"[{config.now_local():%H:%M:%S}] (silence — check the mic)")
                 continue
 
-            when = datetime.datetime.now()
+            when = config.now_local()
             detections = dedupe_per_species(
                 analyzer.analyze(audio, config.SAMPLE_RATE, when=when)
             )
@@ -117,7 +115,7 @@ def main():
                     d["common_name"], d["start_time"], d["end_time"],
                 )
                 db.insert_detection(
-                    conn, when, d["common_name"], d["scientific_name"],
+                    when, d["common_name"], d["scientific_name"],
                     d["confidence"], config.LATITUDE, config.LONGITUDE, clip,
                 )
                 print(
@@ -128,13 +126,11 @@ def main():
             # Keep clip storage under the cap; forget pruned clips in the DB.
             removed = storage.prune_to_cap()
             if removed:
-                db.clear_clip_paths(conn, removed)
+                db.clear_clip_paths(removed)
                 print(f"   (pruned {len(removed)} old clip(s) to stay under "
                       f"{config.MAX_CLIPS_MB} MB)")
     except KeyboardInterrupt:
         print("\nStopped.")
-    finally:
-        conn.close()
 
 
 if __name__ == "__main__":

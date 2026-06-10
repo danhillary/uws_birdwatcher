@@ -7,12 +7,12 @@ Then open http://localhost:8000
 """
 import datetime
 import os
-import sqlite3
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from sqlalchemy.exc import SQLAlchemyError
 
 import config
 import db
@@ -23,11 +23,11 @@ templates = Jinja2Templates(directory=os.path.join(_HERE, "templates"))
 app = FastAPI(title="uws_birdwatcher")
 app.mount("/static", StaticFiles(directory=os.path.join(_HERE, "static")), name="static")
 
-# Best-effort table creation at import. On a read-only host (or before any
-# detections exist) this may fail or do nothing; reads below tolerate that.
+# Best-effort table creation at import. On an unreachable/read-only host (or
+# before any detections exist) this may fail; reads below tolerate that.
 try:
     db.init_db()
-except sqlite3.OperationalError:
+except SQLAlchemyError:
     pass
 
 
@@ -36,11 +36,11 @@ def _read(fn, *args, default=None):
     Keeps the dashboard rendering an empty state instead of erroring."""
     try:
         conn = db.get_conn()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return default
     try:
         return fn(conn, *args)
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         return default
     finally:
         conn.close()
@@ -50,24 +50,33 @@ def _read(fn, *args, default=None):
 def _startup():
     try:
         db.init_db()
-    except sqlite3.OperationalError:
+    except SQLAlchemyError:
         pass
 
 
 # --- Template helpers ----------------------------------------------------
 
-def _fmt_time(iso):
-    try:
-        return datetime.datetime.fromisoformat(iso).strftime("%H:%M:%S")
-    except (ValueError, TypeError):
-        return iso
+def _as_dt(value):
+    """Coerce a Postgres datetime/date or an ISO string to a datetime."""
+    if isinstance(value, datetime.datetime):
+        return value
+    if isinstance(value, datetime.date):
+        return datetime.datetime(value.year, value.month, value.day)
+    return datetime.datetime.fromisoformat(value)
 
 
-def _fmt_date(iso):
+def _fmt_time(value):
     try:
-        return datetime.datetime.fromisoformat(iso).strftime("%b %-d, %Y")
+        return _as_dt(value).strftime("%H:%M:%S")
     except (ValueError, TypeError):
-        return iso
+        return value
+
+
+def _fmt_date(value):
+    try:
+        return _as_dt(value).strftime("%b %-d, %Y")
+    except (ValueError, TypeError):
+        return value
 
 
 templates.env.filters["fmt_time"] = _fmt_time

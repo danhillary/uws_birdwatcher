@@ -1,101 +1,144 @@
-"""SQLite storage for bird detections.
+"""PostgreSQL storage for bird detections.
 
-One table, `detections`, with a row per (de-duplicated) detection. WAL mode is
-enabled so the dashboard can read while the listener writes.
+One table, `detections`, lives in its own schema (``config.DB_SCHEMA``, default
+``birdwatcher``) so it can share a database with other apps (e.g. CEQR) without
+colliding. The home listener writes; the cloud dashboard reads.
+
+Timestamps are stored as timezone-naive *local* time (see ``config.now_local``)
+so "today" and per-hour buckets are correct regardless of where the dashboard
+runs.
 """
-import sqlite3
+import datetime
+
+from sqlalchemy import create_engine, text
 
 import config
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS detections (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    detected_at     TEXT    NOT NULL,   -- ISO 8601 local time
-    common_name     TEXT    NOT NULL,
-    scientific_name TEXT    NOT NULL,
-    confidence      REAL    NOT NULL,
-    lat             REAL,
-    lon             REAL,
-    clip_path       TEXT                -- filename within CLIPS_DIR, or NULL
-);
-CREATE INDEX IF NOT EXISTS idx_detected_at ON detections(detected_at);
-CREATE INDEX IF NOT EXISTS idx_common_name ON detections(common_name);
-"""
+# Lazily-built singleton engine. pool_pre_ping recycles connections dropped by
+# the server/firewall, which matters for a long-running listener.
+_engine = None
+
+
+def _ident(name):
+    """Validate a SQL identifier (schema name) before interpolating it.
+
+    Identifiers can't be passed as bind parameters, so we whitelist a safe
+    character set rather than trusting the value blindly."""
+    if not name.replace("_", "").isalnum():
+        raise ValueError(f"Unsafe SQL identifier: {name!r}")
+    return name
+
+
+_SCHEMA = _ident(config.DB_SCHEMA)
+_TABLE = f'"{_SCHEMA}".detections'
+
+
+def get_engine():
+    global _engine
+    if _engine is None:
+        _engine = create_engine(
+            config.database_url(),
+            pool_pre_ping=True,
+            future=True,
+        )
+    return _engine
 
 
 def get_conn():
-    """Open a connection. Cheap for SQLite; callers may open one per use."""
-    conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
-    return conn
+    """Open a SQLAlchemy connection. The dashboard opens one per request and
+    closes it; the connection pool makes that cheap."""
+    return get_engine().connect()
 
 
 def init_db():
-    conn = get_conn()
-    try:
-        conn.executescript(_SCHEMA)
-        conn.commit()
-    finally:
-        conn.close()
+    """Create the schema, table, and indexes if they don't already exist."""
+    ddl = f"""
+    CREATE SCHEMA IF NOT EXISTS "{_SCHEMA}";
+    CREATE TABLE IF NOT EXISTS {_TABLE} (
+        id              BIGSERIAL PRIMARY KEY,
+        detected_at     TIMESTAMP   NOT NULL,
+        common_name     TEXT        NOT NULL,
+        scientific_name TEXT        NOT NULL,
+        confidence      DOUBLE PRECISION NOT NULL,
+        lat             DOUBLE PRECISION,
+        lon             DOUBLE PRECISION,
+        clip_path       TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_bw_detected_at ON {_TABLE} (detected_at);
+    CREATE INDEX IF NOT EXISTS idx_bw_common_name ON {_TABLE} (common_name);
+    """
+    with get_engine().begin() as conn:
+        for stmt in filter(str.strip, ddl.split(";")):
+            conn.execute(text(stmt))
 
 
-def insert_detection(conn, detected_at, common_name, scientific_name,
+def insert_detection(detected_at, common_name, scientific_name,
                      confidence, lat, lon, clip_path):
-    cur = conn.execute(
-        """INSERT INTO detections
-           (detected_at, common_name, scientific_name, confidence, lat, lon, clip_path)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (detected_at.isoformat(timespec="seconds"), common_name, scientific_name,
-         float(confidence), lat, lon, clip_path),
-    )
-    conn.commit()
-    return cur.lastrowid
+    """Insert one detection. Opens and commits its own transaction."""
+    if isinstance(detected_at, datetime.datetime):
+        detected_at = detected_at.replace(microsecond=0, tzinfo=None)
+    with get_engine().begin() as conn:
+        row = conn.execute(
+            text(f"""INSERT INTO {_TABLE}
+                (detected_at, common_name, scientific_name, confidence, lat, lon, clip_path)
+                VALUES (:detected_at, :common_name, :scientific_name, :confidence, :lat, :lon, :clip_path)
+                RETURNING id"""),
+            {
+                "detected_at": detected_at, "common_name": common_name,
+                "scientific_name": scientific_name, "confidence": float(confidence),
+                "lat": lat, "lon": lon, "clip_path": clip_path,
+            },
+        ).first()
+    return row[0] if row else None
 
 
-def clear_clip_paths(conn, filenames):
+def clear_clip_paths(filenames):
     """Null out clip_path for clips that have been pruned from disk."""
     if not filenames:
         return
-    conn.executemany(
-        "UPDATE detections SET clip_path = NULL WHERE clip_path = ?",
-        [(f,) for f in filenames],
-    )
-    conn.commit()
+    with get_engine().begin() as conn:
+        conn.execute(
+            text(f"UPDATE {_TABLE} SET clip_path = NULL WHERE clip_path = :f"),
+            [{"f": f} for f in filenames],
+        )
 
 
 # --- Queries used by the dashboard --------------------------------------
+# Each takes an open connection and returns plain list[dict] rows.
+
+def _rows(result):
+    return [dict(r) for r in result.mappings().all()]
+
 
 def recent_detections(conn, limit=50):
-    return conn.execute(
-        "SELECT * FROM detections ORDER BY detected_at DESC, id DESC LIMIT ?",
-        (limit,),
-    ).fetchall()
+    return _rows(conn.execute(
+        text(f"SELECT * FROM {_TABLE} ORDER BY detected_at DESC, id DESC LIMIT :limit"),
+        {"limit": limit},
+    ))
 
 
 def counts_for_day(conn, day):
     """Per-species counts for a given YYYY-MM-DD date string."""
-    return conn.execute(
-        """SELECT common_name, scientific_name,
-                  COUNT(*) AS n, MAX(confidence) AS best
-           FROM detections
-           WHERE substr(detected_at, 1, 10) = ?
-           GROUP BY common_name
-           ORDER BY n DESC, best DESC""",
-        (day,),
-    ).fetchall()
+    return _rows(conn.execute(
+        text(f"""SELECT common_name, scientific_name,
+                        COUNT(*) AS n, MAX(confidence) AS best
+                 FROM {_TABLE}
+                 WHERE detected_at::date = CAST(:day AS date)
+                 GROUP BY common_name, scientific_name
+                 ORDER BY n DESC, best DESC"""),
+        {"day": day},
+    ))
 
 
 def hourly_counts_for_day(conn, day):
     """Detection counts per hour (0-23) for a given date string."""
     rows = conn.execute(
-        """SELECT CAST(substr(detected_at, 12, 2) AS INTEGER) AS hour, COUNT(*) AS n
-           FROM detections
-           WHERE substr(detected_at, 1, 10) = ?
-           GROUP BY hour""",
-        (day,),
-    ).fetchall()
+        text(f"""SELECT EXTRACT(HOUR FROM detected_at)::int AS hour, COUNT(*) AS n
+                 FROM {_TABLE}
+                 WHERE detected_at::date = CAST(:day AS date)
+                 GROUP BY hour"""),
+        {"day": day},
+    ).mappings().all()
     counts = [0] * 24
     for r in rows:
         counts[r["hour"]] = r["n"]
@@ -104,19 +147,20 @@ def hourly_counts_for_day(conn, day):
 
 def life_list(conn):
     """Every distinct species ever heard, with first-seen and totals."""
-    return conn.execute(
-        """SELECT common_name, scientific_name,
-                  COUNT(*) AS total,
-                  MIN(detected_at) AS first_seen,
-                  MAX(detected_at) AS last_seen,
-                  MAX(confidence)  AS best
-           FROM detections
-           GROUP BY common_name
-           ORDER BY first_seen ASC""",
-    ).fetchall()
+    return _rows(conn.execute(
+        text(f"""SELECT common_name, scientific_name,
+                        COUNT(*) AS total,
+                        MIN(detected_at) AS first_seen,
+                        MAX(detected_at) AS last_seen,
+                        MAX(confidence)  AS best
+                 FROM {_TABLE}
+                 GROUP BY common_name, scientific_name
+                 ORDER BY first_seen ASC""")
+    ))
 
 
 def distinct_days(conn):
-    return [r["d"] for r in conn.execute(
-        "SELECT DISTINCT substr(detected_at,1,10) AS d FROM detections ORDER BY d DESC"
-    ).fetchall()]
+    rows = conn.execute(
+        text(f"SELECT DISTINCT detected_at::date AS d FROM {_TABLE} ORDER BY d DESC")
+    ).mappings().all()
+    return [r["d"].isoformat() for r in rows]

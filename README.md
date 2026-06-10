@@ -69,9 +69,9 @@ It records ~15-second segments and prints any detections, e.g.:
 [14:32:07] 🐦 American Robin (Turdus migratorius) — 78%  -> 20260609T143207_American_Robin.wav
 ```
 
-Each detection is also saved to a SQLite database (`birdwatcher.db`) with a short
-audio clip in `clips/`. Stop with Ctrl-C. To test without live birds, play a
-birdsong clip near the mic.
+Each detection is also saved to a PostgreSQL database (in the `birdwatcher`
+schema — see Database below) with a short audio clip in `clips/`. Stop with
+Ctrl-C. To test without live birds, play a birdsong clip near the mic.
 
 ## Dashboard
 
@@ -93,6 +93,25 @@ The listener and dashboard share the same database, so the dashboard updates as
 new birds are detected. (The dashboard loads htmx and Chart.js from a CDN, so it
 needs internet access in the browser; everything else runs locally.)
 
+## Database
+
+Detections are stored in **PostgreSQL**, in a dedicated `birdwatcher` schema so
+the database can be shared with other apps without colliding. Both the listener
+and the dashboard connect using the `DB_*` environment variables (see
+Configuration). This is what lets a cloud-hosted dashboard show detections
+recorded on your home machine: the listener writes to the shared database and
+the dashboard reads from it — the **data bridge**.
+
+Copy `.env.example` to `.env` and fill in your connection details:
+
+```bash
+cp .env.example .env   # then edit .env with your DB host/name/user/password
+```
+
+`.env` is gitignored — credentials are never committed. The first run creates
+the schema, table, and indexes automatically. Audio-clip files stay on the
+machine that recorded them (clip playback is a local-only feature for now).
+
 ## Host the dashboard online (Posit Connect Cloud)
 
 The dashboard can be published to [Posit Connect Cloud](https://connect.posit.cloud/),
@@ -105,12 +124,16 @@ which builds straight from this GitHub repo:
    *not* the BirdNET/microphone stack) and serves the app. It auto-redeploys on
    every push.
 
-**Important — the data lives where the mic is.** The microphone listener runs on
-your home machine and writes to a *local* database; a cloud-hosted dashboard
-can't see that. So a freshly deployed dashboard renders but shows no detections
-until a **data bridge** sends them up (e.g. the listener writing to a hosted
-database that the dashboard reads). Audio-clip playback is a local-only feature
-unless clips are also uploaded to cloud storage. See the roadmap.
+5. In Connect Cloud's **Variables**, set `DB_HOST`, `DB_PORT`, `DB_NAME`,
+   `DB_USER`, `DB_PASS`, and `BW_DB_SCHEMA=birdwatcher` so the dashboard reads
+   the shared database.
+
+**The data bridge.** The microphone listener runs on your home machine and
+writes to the shared PostgreSQL database; the cloud-hosted dashboard reads from
+that same database, so detections recorded at home appear online. A freshly
+deployed dashboard renders but stays empty until the listener records something.
+Audio-clip playback remains a local-only feature unless clips are also uploaded
+to cloud storage. See the roadmap.
 
 ## Configuration
 
@@ -125,7 +148,14 @@ variables:
 | `BW_MIN_CONF`       | `0.25`             | Minimum confidence (0–1) to report a detection |
 | `BW_SEGMENT_SECONDS`| `15`               | Length of each recorded segment                |
 | `BW_SAMPLE_RATE`    | `48000`            | Sample rate (BirdNET expects 48 kHz)           |
-| `BW_DB_PATH`        | `birdwatcher.db`   | SQLite database file                           |
+| `DB_HOST`           | `localhost`        | PostgreSQL host                                |
+| `DB_PORT`           | `5432`             | PostgreSQL port                                |
+| `DB_NAME`           | `ceqr`             | PostgreSQL database name                       |
+| `DB_USER`           | *(empty)*          | PostgreSQL user                                |
+| `DB_PASS`           | *(empty)*          | PostgreSQL password                            |
+| `BW_DATABASE_URL`   | *(empty)*          | Full SQLAlchemy URL (overrides the `DB_*` set) |
+| `BW_DB_SCHEMA`      | `birdwatcher`      | Schema holding the detections table            |
+| `BW_TIMEZONE`       | `America/New_York` | Local TZ for "today"/hourly buckets            |
 | `BW_CLIPS_DIR`      | `clips/`           | Folder for saved audio clips                   |
 | `BW_MAX_CLIPS_MB`   | `2000`             | Clip storage cap; oldest clips pruned over it  |
 
@@ -149,7 +179,7 @@ requirements.txt
 ```
 config.py              # central config
 analysis.py            # reusable BirdNET wrapper
-db.py                  # SQLite storage + queries
+db.py                  # PostgreSQL storage + queries (SQLAlchemy)
 storage.py             # clip saving + storage-cap pruning
 capture/
   list_devices.py      # list microphones
@@ -166,6 +196,8 @@ web/
 - **Phase 3** — dashboard: live feed, daily stats, life list, clip playback ✅
 - **Phase 4 (maybe later)** — Docker packaging. Deferred: the native install
   works fine on Windows, so it isn't needed yet.
-- **Phase 5 (in progress)** — host the dashboard on Posit Connect Cloud. App is
-  deploy-ready; next is the data bridge (home listener → hosted database →
-  cloud dashboard), then optional cloud audio storage for clip playback.
+- **Phase 5 (in progress)** — host the dashboard on Posit Connect Cloud. The
+  data bridge is built: storage moved to PostgreSQL (`birdwatcher` schema) so the
+  home listener and cloud dashboard share one database ✅. Next: set the cloud
+  env vars and deploy, then optional cloud audio storage (e.g. S3) for clip
+  playback.
