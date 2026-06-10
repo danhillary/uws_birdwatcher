@@ -1,11 +1,14 @@
 # uws_birdwatcher
 
 Point a microphone out the window, identify the birds you hear with
-[BirdNET](https://github.com/kahst/BirdNET-Analyzer) (Cornell Lab), and
-(eventually) show them on a dashboard.
+[BirdNET](https://github.com/kahst/BirdNET-Analyzer) (Cornell Lab), and show them
+on a live dashboard — **The Ramble Register**.
 
-**Phase 1 (done):** microphone → BirdNET → live detections printed to the
-terminal, filtered to species likely at your location and time of year.
+The full pipeline is running: a microphone next to the window feeds BirdNET,
+which writes each identified bird to a shared PostgreSQL database; a Streamlit
+dashboard hosted on Posit Connect Cloud reads that database and shows the live
+feed, daily stats, and a life list. Detections are filtered to species likely at
+your location and time of year.
 
 ## Requirements
 
@@ -217,9 +220,12 @@ requirements-listen.txt# adds the BirdNET + microphone stack (home machine only)
 - **Phase 3** — dashboard: live feed, daily stats, life list, clip playback ✅
 - **Phase 4 (maybe later)** — Docker packaging. Deferred: the native install
   works fine on Windows, so it isn't needed yet.
-- **Phase 5 (in progress)** — host the dashboard on Posit Connect Cloud. The
-  data bridge is built: storage moved to PostgreSQL (`birdwatcher` schema) so the
-  home listener and cloud dashboard share one database ✅, and the dashboard was
-  rebuilt in Streamlit (Connect Cloud doesn't host raw FastAPI) ✅. Next: set the
-  cloud env vars and deploy, then optional cloud audio storage (e.g. S3) for clip
-  playback.
+- **Phase 5 (done)** — host the dashboard on Posit Connect Cloud. Storage moved
+  to PostgreSQL (`birdwatcher` schema) so the home listener and cloud dashboard
+  share one database ✅; the dashboard was rebuilt in Streamlit (Connect Cloud
+  doesn't host raw FastAPI) and branded as **The Ramble Register** ✅; deployed to
+  Connect Cloud with the `DB_*`/`BW_DB_SCHEMA` env vars set ✅; the Windows
+  listener runs in the background and writes to the shared database, so home
+  detections appear online — the **data bridge** is live end-to-end ✅.
+- **Phase 6 (maybe later)** — optional cloud audio storage (e.g. S3) so clip
+  playback works from the hosted dashboard, not just the recording machine.
