@@ -4,3 +4,6 @@ tensorflow
 sounddevice
 soundfile
 numpy
+fastapi
+uvicorn[standard]
+jinja2

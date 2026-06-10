@@ -61,10 +61,32 @@ devices connect/disconnect) or by index. See Configuration below.
 It records ~15-second segments and prints any detections, e.g.:
 
 ```
-[14:32:07] 🐦 American Robin (Turdus migratorius) — 78%
+[14:32:07] 🐦 American Robin (Turdus migratorius) — 78%  -> 20260609T143207_American_Robin.wav
 ```
 
-Stop with Ctrl-C. To test without live birds, play a birdsong clip near the mic.
+Each detection is also saved to a SQLite database (`birdwatcher.db`) with a short
+audio clip in `clips/`. Stop with Ctrl-C. To test without live birds, play a
+birdsong clip near the mic.
+
+## Dashboard
+
+In a **second terminal** (leave the listener running in the first), start the
+web dashboard:
+
+```bash
+# Windows:  .venv\Scripts\python -m uvicorn web.app:app --port 8000
+# macOS:    .venv/bin/python  -m uvicorn web.app:app --port 8000
+```
+
+Open **http://localhost:8000**. Three views:
+
+- **Live feed** — most recent detections, auto-refreshing, with playable clips
+- **Daily stats** — per-species counts and an activity-by-hour chart (pick a day)
+- **Life list** — every species ever heard, first/last heard, totals
+
+The listener and dashboard share the same database, so the dashboard updates as
+new birds are detected. (The dashboard loads htmx and Chart.js from a CDN, so it
+needs internet access in the browser; everything else runs locally.)
 
 ## Configuration
 
@@ -79,6 +101,9 @@ variables:
 | `BW_MIN_CONF`       | `0.25`             | Minimum confidence (0–1) to report a detection |
 | `BW_SEGMENT_SECONDS`| `15`               | Length of each recorded segment                |
 | `BW_SAMPLE_RATE`    | `48000`            | Sample rate (BirdNET expects 48 kHz)           |
+| `BW_DB_PATH`        | `birdwatcher.db`   | SQLite database file                           |
+| `BW_CLIPS_DIR`      | `clips/`           | Folder for saved audio clips                   |
+| `BW_MAX_CLIPS_MB`   | `2000`             | Clip storage cap; oldest clips pruned over it  |
 
 Example (PowerShell): `$env:BW_INPUT_DEVICE="UAC"; .venv\Scripts\python -m capture.listen`
 
@@ -95,8 +120,25 @@ capture/
 requirements.txt
 ```
 
+## Project layout (updated)
+
+```
+config.py              # central config
+analysis.py            # reusable BirdNET wrapper
+db.py                  # SQLite storage + queries
+storage.py             # clip saving + storage-cap pruning
+capture/
+  list_devices.py      # list microphones
+  listen.py            # record -> identify -> save to DB + clips
+web/
+  app.py               # FastAPI dashboard
+  templates/  static/  # pages and styles
+```
+
 ## Roadmap
 
-- **Phase 2** — save detections to SQLite + store an audio clip per bird
-- **Phase 3** — FastAPI dashboard: live feed, daily stats, life list, clip playback
-- **Phase 4** — Docker packaging (native capture client + dockerized analyzer/dashboard)
+- **Phase 1** — microphone → BirdNET → terminal ✅
+- **Phase 2** — SQLite storage + audio clips + storage-cap pruning ✅
+- **Phase 3** — dashboard: live feed, daily stats, life list, clip playback ✅
+- **Phase 4 (maybe later)** — Docker packaging. Deferred: the native install
+  works fine on Windows, so it isn't needed yet.

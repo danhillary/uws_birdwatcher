@@ -1,22 +1,23 @@
-"""Phase 1 prototype: listen on the microphone and print identified birds.
+"""Listen on the microphone, identify birds with BirdNET, and record them.
 
-Captures fixed-length audio segments from the mic, runs BirdNET on each
-(filtered to species likely at your location/date), and prints any detections
-to the terminal.
+Captures fixed-length audio segments, runs BirdNET on each (filtered to species
+likely at your location/date), then for every detection: prints it, saves a
+short audio clip, and stores a row in the database. Old clips are pruned to stay
+under the configured storage cap.
 
 Run with:  python -m capture.listen
 Stop with: Ctrl-C
 """
 import datetime
-import os
 import sys
-import tempfile
 
 import numpy as np
 import sounddevice as sd
-import soundfile as sf
 
 import config
+import db
+import storage
+from analysis import BirdAnalyzer, dedupe_per_species
 
 
 def resolve_device(spec):
@@ -67,11 +68,6 @@ def record_segment(device, channels):
 
 
 def main():
-    # Import here so device-listing / --help works even before the heavy
-    # TensorFlow stack is importable.
-    from birdnetlib import Recording
-    from birdnetlib.analyzer import Analyzer
-
     try:
         device = resolve_device(config.INPUT_DEVICE)
     except ValueError as e:
@@ -80,19 +76,21 @@ def main():
     info = sd.query_devices(device)
     channels = min(config.CHANNELS, info["max_input_channels"])
 
-    print("Loading BirdNET model (first run downloads/initialises, ~10-20s)...")
-    analyzer = Analyzer()
+    db.init_db()
+    storage.ensure_dirs()
 
-    dev_name = info["name"]
+    print("Loading BirdNET model (first run downloads/initialises, ~10-20s)...")
+    analyzer = BirdAnalyzer()
+    conn = db.get_conn()
+
     print(
-        f"Listening on '{dev_name}' "
+        f"Listening on '{info['name']}' "
         f"@ {config.SAMPLE_RATE} Hz, {config.SEGMENT_SECONDS}s segments.\n"
         f"Location: {config.LATITUDE}, {config.LONGITUDE} | "
         f"min confidence: {config.MIN_CONFIDENCE}\n"
+        f"Saving to: {config.DB_PATH}\n"
         f"Press Ctrl-C to stop.\n"
     )
-
-    tmp_path = os.path.join(tempfile.gettempdir(), "bw_segment.wav")
 
     try:
         while True:
@@ -103,29 +101,40 @@ def main():
                 print(f"[{datetime.datetime.now():%H:%M:%S}] (silence — check the mic)")
                 continue
 
-            sf.write(tmp_path, audio, config.SAMPLE_RATE)
-
-            recording = Recording(
-                analyzer,
-                tmp_path,
-                lat=config.LATITUDE,
-                lon=config.LONGITUDE,
-                date=datetime.datetime.now(),
-                min_conf=config.MIN_CONFIDENCE,
+            when = datetime.datetime.now()
+            detections = dedupe_per_species(
+                analyzer.analyze(audio, config.SAMPLE_RATE, when=when)
             )
-            recording.analyze()
 
-            now = f"{datetime.datetime.now():%H:%M:%S}"
-            if recording.detections:
-                for d in recording.detections:
-                    print(
-                        f"[{now}] \U0001F426 {d['common_name']} "
-                        f"({d['scientific_name']}) — {d['confidence']:.0%}"
-                    )
-            else:
-                print(f"[{now}] ... no birds detected")
+            stamp = f"{when:%H:%M:%S}"
+            if not detections:
+                print(f"[{stamp}] ... no birds detected")
+                continue
+
+            for d in detections:
+                clip = storage.save_clip(
+                    audio, config.SAMPLE_RATE, when,
+                    d["common_name"], d["start_time"], d["end_time"],
+                )
+                db.insert_detection(
+                    conn, when, d["common_name"], d["scientific_name"],
+                    d["confidence"], config.LATITUDE, config.LONGITUDE, clip,
+                )
+                print(
+                    f"[{stamp}] \U0001F426 {d['common_name']} "
+                    f"({d['scientific_name']}) — {d['confidence']:.0%}  -> {clip}"
+                )
+
+            # Keep clip storage under the cap; forget pruned clips in the DB.
+            removed = storage.prune_to_cap()
+            if removed:
+                db.clear_clip_paths(conn, removed)
+                print(f"   (pruned {len(removed)} old clip(s) to stay under "
+                      f"{config.MAX_CLIPS_MB} MB)")
     except KeyboardInterrupt:
         print("\nStopped.")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

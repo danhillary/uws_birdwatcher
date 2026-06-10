@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Live feed · Birdwatcher{% endblock %}
+{% block content %}
+<div class="section-head">
+  <h2>Live feed</h2>
+  <span class="hint">auto-refreshing every 10s</span>
+</div>
+<div id="feed" hx-get="/partials/feed" hx-trigger="every 10s" hx-swap="innerHTML">
+  {% include "_feed_rows.html" %}
+</div>
+{% endblock %}

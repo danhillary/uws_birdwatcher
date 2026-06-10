@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Daily stats · Birdwatcher{% endblock %}
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+{% endblock %}
+{% block content %}
+<div class="section-head">
+  <h2>Daily stats</h2>
+  {% if days %}
+  <form method="get" action="/stats">
+    <select name="day" onchange="this.form.submit()">
+      {% for d in days %}
+      <option value="{{ d }}" {{ 'selected' if d == day }}>{{ d }}</option>
+      {% endfor %}
+    </select>
+  </form>
+  {% endif %}
+</div>
+
+<p class="summary">{{ total }} detection{{ '' if total == 1 else 's' }} on {{ day }}
+  across {{ counts | length }} species.</p>
+
+<div class="card">
+  <h3>Activity by hour</h3>
+  <canvas id="hourly" height="90"></canvas>
+</div>
+
+<div class="card">
+  <h3>Species today</h3>
+  {% if counts %}
+  <table class="detections">
+    <thead><tr><th>Species</th><th>Count</th><th>Best confidence</th></tr></thead>
+    <tbody>
+      {% for r in counts %}
+      <tr>
+        <td class="species"><span class="common">{{ r['common_name'] }}</span>
+          <span class="sci">{{ r['scientific_name'] }}</span></td>
+        <td class="num">{{ r['n'] }}</td>
+        <td class="num">{{ (r['best'] * 100) | round(0, 'floor') | int }}%</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No detections on this day.</p>
+  {% endif %}
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+  const hourly = {{ hourly | tojson }};
+  new Chart(document.getElementById('hourly'), {
+    type: 'bar',
+    data: {
+      labels: Array.from({length: 24}, (_, h) => String(h).padStart(2, '0')),
+      datasets: [{ label: 'Detections', data: hourly, backgroundColor: '#4c9a6a' }]
+    },
+    options: {
+      plugins: { legend: { display: false } },
+      scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }
+    }
+  });
+</script>
+{% endblock %}
