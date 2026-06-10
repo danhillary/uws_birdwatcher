@@ -9,6 +9,12 @@ Run locally with:
 """
 import datetime
 import os
+import sys
+
+# Ensure local modules (config, db) are importable regardless of how the host
+# launches this script. Posit Connect Cloud doesn't always put the project root
+# on sys.path the way a local `streamlit run` does.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pandas as pd
 import streamlit as st
