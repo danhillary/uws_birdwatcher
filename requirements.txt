@@ -1,0 +1,6 @@
+birdnetlib
+librosa
+tensorflow
+sounddevice
+soundfile
+numpy
