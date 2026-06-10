@@ -8,6 +8,7 @@ under the configured storage cap.
 Run with:  python -m capture.listen
 Stop with: Ctrl-C
 """
+import socket
 import sys
 
 import numpy as np
@@ -103,11 +104,23 @@ def main():
         f"Press Ctrl-C to stop.\n"
     )
 
+    host = socket.gethostname()
+    last_det = None  # time of the most recent detection, for the heartbeat
+
     try:
         while True:
             audio = record_segment(device, channels)
 
             peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+
+            # Heartbeat: let the dashboard see we're alive and what the mic is
+            # hearing, even during long silent stretches. Never let a DB hiccup
+            # kill the capture loop.
+            try:
+                db.record_heartbeat(host, peak, last_det)
+            except Exception as e:
+                print(f"   (heartbeat write failed: {e})")
+
             if peak < 1e-4:
                 print(f"[{config.now_local():%H:%M:%S}] (silence — check the mic)")
                 continue
@@ -135,6 +148,7 @@ def main():
                     f"[{stamp}] \U0001F426 {d['common_name']} "
                     f"({d['scientific_name']}) — {d['confidence']:.0%}  -> {clip}"
                 )
+                last_det = when
 
             # Keep clip storage under the cap; forget pruned clips in the DB.
             removed = storage.prune_to_cap()

@@ -31,6 +31,7 @@ def _ident(name):
 
 _SCHEMA = _ident(config.DB_SCHEMA)
 _TABLE = f'"{_SCHEMA}".detections'
+_STATUS = f'"{_SCHEMA}".listener_status'
 
 
 def get_engine():
@@ -66,6 +67,12 @@ def init_db():
     );
     CREATE INDEX IF NOT EXISTS idx_bw_detected_at ON {_TABLE} (detected_at);
     CREATE INDEX IF NOT EXISTS idx_bw_common_name ON {_TABLE} (common_name);
+    CREATE TABLE IF NOT EXISTS {_STATUS} (
+        host              TEXT PRIMARY KEY,
+        updated_at        TIMESTAMP NOT NULL,
+        last_peak         DOUBLE PRECISION,
+        last_detection_at TIMESTAMP
+    );
     """
     with get_engine().begin() as conn:
         for stmt in filter(str.strip, ddl.split(";")):
@@ -90,6 +97,33 @@ def insert_detection(detected_at, common_name, scientific_name,
             },
         ).first()
     return row[0] if row else None
+
+
+def record_heartbeat(host, last_peak, last_detection_at=None):
+    """Upsert a 'still alive' pulse for one listener host.
+
+    Called every capture loop (~every segment) so the dashboard can tell a
+    quiet-but-running listener from a crashed one. ``last_peak`` is the segment's
+    audio level (near zero => the mic is muted/unplugged)."""
+    if isinstance(last_detection_at, datetime.datetime):
+        last_detection_at = last_detection_at.replace(microsecond=0, tzinfo=None)
+    with get_engine().begin() as conn:
+        conn.execute(
+            text(f"""INSERT INTO {_STATUS}
+                    (host, updated_at, last_peak, last_detection_at)
+                    VALUES (:host, :updated_at, :last_peak, :last_detection_at)
+                    ON CONFLICT (host) DO UPDATE SET
+                        updated_at        = EXCLUDED.updated_at,
+                        last_peak         = EXCLUDED.last_peak,
+                        last_detection_at = COALESCE(EXCLUDED.last_detection_at,
+                                                     {_STATUS}.last_detection_at)"""),
+            {
+                "host": host,
+                "updated_at": config.now_local().replace(microsecond=0),
+                "last_peak": float(last_peak),
+                "last_detection_at": last_detection_at,
+            },
+        )
 
 
 def clear_clip_paths(filenames):
@@ -178,6 +212,20 @@ def overview(conn):
     return dict(row) if row else {
         "total": 0, "species": 0, "first_at": None, "last_at": None,
     }
+
+
+def listener_status(conn):
+    """The freshest listener heartbeat, or None if none recorded yet.
+
+    Returns a dict with host, updated_at, last_peak, last_detection_at; the
+    dashboard turns updated_at's age and last_peak into a health indicator."""
+    row = conn.execute(text(f"""
+        SELECT host, updated_at, last_peak, last_detection_at
+        FROM {_STATUS}
+        ORDER BY updated_at DESC
+        LIMIT 1
+    """)).mappings().first()
+    return dict(row) if row else None
 
 
 def detections_per_day(conn, days=14):

@@ -122,6 +122,13 @@ Streamlit opens **http://localhost:8501** automatically. Three tabs:
 - **Daily stats** — per-species counts and an activity-by-hour chart (pick a day)
 - **Life list** — every species ever heard, first/last heard, totals
 
+Below the summary cards a **listener health** pill shows whether the recording
+machine is alive: 🟢 listening (with the live mic level), 🟡 running but the mic
+is silent (likely unplugged/muted), or 🔴 offline (no heartbeat — crashed or
+asleep). The listener writes a heartbeat every segment to a small
+`listener_status` table, so a quiet-but-healthy setup is easy to tell apart from
+a dead one.
+
 The listener and dashboard share the same database, so the dashboard updates as
 new birds are detected. Audio-clip playback works on the machine that recorded
 the clips (the files stay local).

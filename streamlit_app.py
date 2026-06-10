@@ -133,6 +133,11 @@ def load_recent(limit=100):
     return _read(db.recent_detections, limit, default=[]) or []
 
 
+def load_status():
+    # Not cached — the heartbeat freshness is the whole point of this read.
+    return _read(db.listener_status, default=None)
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def species_photo(common_name, scientific_name):
     """Thumbnail URL for a species from Wikipedia, or None. Cached a day.
@@ -182,6 +187,18 @@ def _as_date(v):
     if isinstance(v, datetime.datetime):
         return v.date()
     return v
+
+
+def _humanize_age(seconds):
+    """A compact 'time ago' string: 8s, 5m, 2h, 3d."""
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
 
 
 def _local_clip(name):
@@ -266,6 +283,54 @@ st.markdown(
 )
 st.write("")
 header_metrics()
+
+
+@st.fragment(run_every=_REFRESH)
+def listener_health():
+    """A traffic-light pill telling apart three failure modes: process down
+    (no recent heartbeat), mic dead (heartbeat fine but audio level ~0), and
+    a healthy-but-quiet listener."""
+    s = load_status()
+    seg = getattr(config, "SEGMENT_SECONDS", 15)
+    stale_after = max(60, seg * 4)  # a couple of missed segments = trouble
+    now = config.now_local()
+
+    if not s or not s.get("updated_at"):
+        bg, border, icon = "#eef1f2", "#c4cdd1", "\U000026AA"
+        msg = ("Listener status unknown — no heartbeat recorded yet. Start the "
+               "listener on the recording machine.")
+    else:
+        age = (now - s["updated_at"]).total_seconds()
+        peak = s.get("last_peak") or 0.0
+        last_det = s.get("last_detection_at")
+        det_txt = (f" · last bird {_humanize_age((now - last_det).total_seconds())} ago"
+                   if last_det else "")
+        if age > stale_after:
+            bg, border, icon = "#fbecec", "#c0504d", "\U0001F534"
+            msg = (f"Listener offline — no heartbeat for {_humanize_age(age)}. "
+                   "It may have crashed, or the machine is asleep.")
+        elif peak < 1e-4:
+            bg, border, icon = "#fdf6e3", "#d99a2b", "\U0001F7E1"
+            msg = (f"Listener running, but the mic is silent (level {peak:.4f}) — "
+                   "check that the microphone is plugged in and unmuted.")
+        else:
+            bg, border, icon = "#eaf7ef", "#4c9a6a", "\U0001F7E2"
+            msg = (f"Listening — heartbeat {_humanize_age(age)} ago · "
+                   f"mic level {peak:.3f}{det_txt}.")
+
+    st.markdown(
+        f"""
+        <div style="background:{bg};border:1px solid {border};
+            border-left:4px solid {border};border-radius:10px;
+            padding:9px 14px;margin-top:8px;font-size:0.9rem;color:#1d3b32;">
+            {icon}&nbsp; {msg}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+listener_health()
 st.divider()
 
 
