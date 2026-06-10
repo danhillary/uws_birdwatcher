@@ -7,6 +7,7 @@ Then open http://localhost:8000
 """
 import datetime
 import os
+import sqlite3
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
@@ -22,10 +23,35 @@ templates = Jinja2Templates(directory=os.path.join(_HERE, "templates"))
 app = FastAPI(title="uws_birdwatcher")
 app.mount("/static", StaticFiles(directory=os.path.join(_HERE, "static")), name="static")
 
+# Best-effort table creation at import. On a read-only host (or before any
+# detections exist) this may fail or do nothing; reads below tolerate that.
+try:
+    db.init_db()
+except sqlite3.OperationalError:
+    pass
+
+
+def _read(fn, *args, default=None):
+    """Run a db read function, returning `default` if the DB/table isn't ready.
+    Keeps the dashboard rendering an empty state instead of erroring."""
+    try:
+        conn = db.get_conn()
+    except sqlite3.OperationalError:
+        return default
+    try:
+        return fn(conn, *args)
+    except sqlite3.OperationalError:
+        return default
+    finally:
+        conn.close()
+
 
 @app.on_event("startup")
 def _startup():
-    db.init_db()
+    try:
+        db.init_db()
+    except sqlite3.OperationalError:
+        pass
 
 
 # --- Template helpers ----------------------------------------------------
@@ -56,11 +82,7 @@ def _today():
 
 @app.get("/", response_class=HTMLResponse)
 def feed(request: Request):
-    conn = db.get_conn()
-    try:
-        rows = db.recent_detections(conn, limit=100)
-    finally:
-        conn.close()
+    rows = _read(db.recent_detections, 100, default=[])
     return templates.TemplateResponse(
         request, "feed.html", {"rows": rows, "active": "feed"}
     )
@@ -69,11 +91,7 @@ def feed(request: Request):
 @app.get("/partials/feed", response_class=HTMLResponse)
 def feed_partial(request: Request):
     """Just the table rows, for HTMX auto-refresh."""
-    conn = db.get_conn()
-    try:
-        rows = db.recent_detections(conn, limit=100)
-    finally:
-        conn.close()
+    rows = _read(db.recent_detections, 100, default=[])
     return templates.TemplateResponse(
         request, "_feed_rows.html", {"rows": rows}
     )
@@ -82,13 +100,9 @@ def feed_partial(request: Request):
 @app.get("/stats", response_class=HTMLResponse)
 def stats(request: Request, day: str | None = None):
     day = day or _today()
-    conn = db.get_conn()
-    try:
-        counts = db.counts_for_day(conn, day)
-        hourly = db.hourly_counts_for_day(conn, day)
-        days = db.distinct_days(conn)
-    finally:
-        conn.close()
+    counts = _read(db.counts_for_day, day, default=[])
+    hourly = _read(db.hourly_counts_for_day, day, default=[0] * 24)
+    days = _read(db.distinct_days, default=[])
     return templates.TemplateResponse(
         request, "stats.html",
         {
@@ -101,11 +115,7 @@ def stats(request: Request, day: str | None = None):
 
 @app.get("/species", response_class=HTMLResponse)
 def species(request: Request):
-    conn = db.get_conn()
-    try:
-        rows = db.life_list(conn)
-    finally:
-        conn.close()
+    rows = _read(db.life_list, default=[])
     return templates.TemplateResponse(
         request, "species.html", {"active": "species", "rows": rows}
     )

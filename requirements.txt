@@ -1,9 +1,5 @@
-birdnetlib
-librosa
-tensorflow
-sounddevice
-soundfile
-numpy
+# Dashboard / web deployment dependencies (Posit Connect Cloud installs these).
+# The microphone listener needs additional packages — see requirements-listen.txt.
 fastapi
 uvicorn[standard]
 jinja2

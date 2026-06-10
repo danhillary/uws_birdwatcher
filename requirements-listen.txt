@@ -1,0 +1,9 @@
+# Microphone listener dependencies (home machine next to the mic).
+# Install alongside the base requirements:
+#   pip install -r requirements.txt -r requirements-listen.txt
+birdnetlib
+librosa
+tensorflow
+sounddevice
+soundfile
+numpy

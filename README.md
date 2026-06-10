@@ -25,7 +25,7 @@ Install Python 3.11 from [python.org](https://www.python.org/downloads/release/p
 ```powershell
 py -3.11 -m venv .venv
 .venv\Scripts\python -m pip install --upgrade pip
-.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python -m pip install -r requirements.txt -r requirements-listen.txt
 ```
 
 ### macOS / Linux
@@ -34,10 +34,15 @@ py -3.11 -m venv .venv
 # macOS: install Python 3.11 if needed -> brew install python@3.11
 python3.11 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements.txt -r requirements-listen.txt
 ```
 
 > First run downloads/initialises the BirdNET model and takes ~10–20s.
+
+> **Two requirements files:** `requirements.txt` holds the lightweight dashboard
+> deps; `requirements-listen.txt` adds the microphone + BirdNET stack. The
+> machine next to the mic needs both (as above). A host that only runs the
+> dashboard (e.g. Posit Connect Cloud) installs just `requirements.txt`.
 
 ## Pick your microphone
 
@@ -87,6 +92,25 @@ Open **http://localhost:8000**. Three views:
 The listener and dashboard share the same database, so the dashboard updates as
 new birds are detected. (The dashboard loads htmx and Chart.js from a CDN, so it
 needs internet access in the browser; everything else runs locally.)
+
+## Host the dashboard online (Posit Connect Cloud)
+
+The dashboard can be published to [Posit Connect Cloud](https://connect.posit.cloud/),
+which builds straight from this GitHub repo:
+
+1. At connect.posit.cloud, click **Publish** and choose the **FastAPI** framework.
+2. Pick this repository and branch.
+3. Set the **primary file** to `app.py` (it exposes the FastAPI `app`).
+4. Publish. Connect Cloud installs `requirements.txt` (the slim dashboard deps —
+   *not* the BirdNET/microphone stack) and serves the app. It auto-redeploys on
+   every push.
+
+**Important — the data lives where the mic is.** The microphone listener runs on
+your home machine and writes to a *local* database; a cloud-hosted dashboard
+can't see that. So a freshly deployed dashboard renders but shows no detections
+until a **data bridge** sends them up (e.g. the listener writing to a hosted
+database that the dashboard reads). Audio-clip playback is a local-only feature
+unless clips are also uploaded to cloud storage. See the roadmap.
 
 ## Configuration
 
@@ -142,3 +166,6 @@ web/
 - **Phase 3** — dashboard: live feed, daily stats, life list, clip playback ✅
 - **Phase 4 (maybe later)** — Docker packaging. Deferred: the native install
   works fine on Windows, so it isn't needed yet.
+- **Phase 5 (in progress)** — host the dashboard on Posit Connect Cloud. App is
+  deploy-ready; next is the data bridge (home listener → hosted database →
+  cloud dashboard), then optional cloud audio storage for clip playback.
