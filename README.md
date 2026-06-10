@@ -75,23 +75,23 @@ Ctrl-C. To test without live birds, play a birdsong clip near the mic.
 
 ## Dashboard
 
-In a **second terminal** (leave the listener running in the first), start the
-web dashboard:
+The dashboard is a [Streamlit](https://streamlit.io/) app. In a **second
+terminal** (leave the listener running in the first), start it:
 
 ```bash
-# Windows:  .venv\Scripts\python -m uvicorn web.app:app --port 8000
-# macOS:    .venv/bin/python  -m uvicorn web.app:app --port 8000
+# Windows:  .venv\Scripts\streamlit run streamlit_app.py
+# macOS:    .venv/bin/streamlit run streamlit_app.py
 ```
 
-Open **http://localhost:8000**. Three views:
+Streamlit opens **http://localhost:8501** automatically. Three tabs:
 
 - **Live feed** — most recent detections, auto-refreshing, with playable clips
 - **Daily stats** — per-species counts and an activity-by-hour chart (pick a day)
 - **Life list** — every species ever heard, first/last heard, totals
 
 The listener and dashboard share the same database, so the dashboard updates as
-new birds are detected. (The dashboard loads htmx and Chart.js from a CDN, so it
-needs internet access in the browser; everything else runs locally.)
+new birds are detected. Audio-clip playback works on the machine that recorded
+the clips (the files stay local).
 
 ## Database
 
@@ -117,13 +117,13 @@ machine that recorded them (clip playback is a local-only feature for now).
 The dashboard can be published to [Posit Connect Cloud](https://connect.posit.cloud/),
 which builds straight from this GitHub repo:
 
-1. At connect.posit.cloud, click **Publish** and choose the **FastAPI** framework.
+1. At connect.posit.cloud, click **Publish** → **From GitHub** and choose the
+   **Streamlit** framework.
 2. Pick this repository and branch.
-3. Set the **primary file** to `app.py` (it exposes the FastAPI `app`).
+3. Set the **primary file** to `streamlit_app.py`.
 4. Publish. Connect Cloud installs `requirements.txt` (the slim dashboard deps —
    *not* the BirdNET/microphone stack) and serves the app. It auto-redeploys on
    every push.
-
 5. In Connect Cloud's **Variables**, set `DB_HOST`, `DB_PORT`, `DB_NAME`,
    `DB_USER`, `DB_PASS`, and `BW_DB_SCHEMA=birdwatcher` so the dashboard reads
    the shared database.
@@ -167,26 +167,17 @@ Example (PowerShell): `$env:BW_INPUT_DEVICE="UAC"; .venv\Scripts\python -m captu
 ## Project layout
 
 ```
-config.py              # central config (location, mic, thresholds)
-capture/
-  list_devices.py      # list available microphones
-  listen.py            # Phase 1: mic -> BirdNET -> terminal
-requirements.txt
-```
-
-## Project layout (updated)
-
-```
-config.py              # central config
+config.py              # central config (location, mic, thresholds, DB, timezone)
 analysis.py            # reusable BirdNET wrapper
 db.py                  # PostgreSQL storage + queries (SQLAlchemy)
 storage.py             # clip saving + storage-cap pruning
+streamlit_app.py       # Streamlit dashboard (also the Connect Cloud primary file)
 capture/
   list_devices.py      # list microphones
   listen.py            # record -> identify -> save to DB + clips
-web/
-  app.py               # FastAPI dashboard
-  templates/  static/  # pages and styles
+requirements.txt       # slim dashboard deps (Connect Cloud installs these)
+requirements-listen.txt# adds the BirdNET + microphone stack (home machine only)
+.env.example           # template for DB credentials (copy to .env)
 ```
 
 ## Roadmap
@@ -198,6 +189,7 @@ web/
   works fine on Windows, so it isn't needed yet.
 - **Phase 5 (in progress)** — host the dashboard on Posit Connect Cloud. The
   data bridge is built: storage moved to PostgreSQL (`birdwatcher` schema) so the
-  home listener and cloud dashboard share one database ✅. Next: set the cloud
-  env vars and deploy, then optional cloud audio storage (e.g. S3) for clip
+  home listener and cloud dashboard share one database ✅, and the dashboard was
+  rebuilt in Streamlit (Connect Cloud doesn't host raw FastAPI) ✅. Next: set the
+  cloud env vars and deploy, then optional cloud audio storage (e.g. S3) for clip
   playback.
