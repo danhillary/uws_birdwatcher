@@ -257,7 +257,7 @@ st.markdown(
     <div class="ramble-header">
         <div class="ramble-kicker">Upper West Side · NYC</div>
         <div class="ramble-title">\U0001F426 The Ramble Register</div>
-        <div class="ramble-sub">Birdsong heard from a window over the
+        <div class="ramble-sub">Birdsong heard from a backyard on the
             Upper West Side — Central Park &amp; Riverside, NYC.</div>
         <div class="ramble-note">{_chorus_note()}</div>
     </div>
