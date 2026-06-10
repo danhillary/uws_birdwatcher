@@ -66,7 +66,20 @@ def record_segment(device, channels):
     return audio.reshape(-1)
 
 
+def _force_utf8_output():
+    """Windows consoles default to cp1252, which can't encode the 🐦 emoji or
+    accented species names — printing a detection there raises
+    UnicodeEncodeError and kills the listener. Force UTF-8 (replacing anything
+    unencodable) so output never crashes the capture loop."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass  # already UTF-8, or a stream without reconfigure()
+
+
 def main():
+    _force_utf8_output()
     try:
         device = resolve_device(config.INPUT_DEVICE)
     except ValueError as e:
