@@ -26,7 +26,50 @@ from sqlalchemy.exc import SQLAlchemyError
 import config
 import db
 
-st.set_page_config(page_title="uws_birdwatcher", page_icon="\U0001F426", layout="wide")
+st.set_page_config(
+    page_title="The Ramble Register",
+    page_icon="\U0001F426",
+    layout="wide",
+)
+
+# "Central Park Morning" styling: clean sans type, robin's-egg header band,
+# meadow-green accents, and softly-carded metrics. The colour theme itself lives
+# in .streamlit/config.toml; this just adds the finishing polish.
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    .stApp, section[data-testid="stSidebar"] { font-family: 'Inter', system-ui, sans-serif; }
+
+    .ramble-header {
+        background: linear-gradient(135deg, #eaf4f7 0%, #dcecef 55%, #d2eade 100%);
+        border: 1px solid #cfe3e8;
+        border-radius: 16px;
+        padding: 20px 26px;
+        margin-bottom: 6px;
+    }
+    .ramble-kicker {
+        color: #4f93a6; font-weight: 600; text-transform: uppercase;
+        letter-spacing: 0.16em; font-size: 0.72rem;
+    }
+    .ramble-title {
+        font-size: 2.1rem; font-weight: 700; color: #1d3b32;
+        letter-spacing: -0.02em; margin: 2px 0 0 0;
+    }
+    .ramble-sub { color: #3f6b5e; font-size: 0.98rem; margin-top: 4px; }
+    .ramble-note { color: #6a8a7f; font-size: 0.86rem; margin-top: 6px; }
+
+    div[data-testid="stMetric"] {
+        background: #ffffff; border: 1px solid #e2eef0;
+        border-left: 4px solid #4c9a6a; border-radius: 12px;
+        padding: 14px 16px; box-shadow: 0 1px 3px rgba(31,61,52,0.05);
+    }
+    div[data-testid="stMetricLabel"] p { color: #5a7d72; font-weight: 600; }
+    button[data-baseweb="tab"] { font-weight: 600; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # Best-effort table creation. On an unreachable/read-only host (or before any
 # detections exist) this may fail; the reads below tolerate that and render an
@@ -152,7 +195,7 @@ def _local_clip(name):
 
 # --- Sidebar -------------------------------------------------------------
 
-st.sidebar.title("\U0001F426 Birdwatcher")
+st.sidebar.title("\U0001F426 The Ramble Register")
 st.sidebar.caption(f"Upper West Side, NYC · {config.LATITUDE}, {config.LONGITUDE}")
 live = st.sidebar.checkbox("Live updates (10s)", value=True, key="live")
 show_photos = st.sidebar.checkbox("Show bird photos", value=True, key="photos")
@@ -165,7 +208,29 @@ if ov.get("last_at"):
     st.sidebar.caption(f"Last detection: {_fmt_date(ov['last_at'])} "
                        f"{_fmt_time(ov['last_at'])}")
 
+with st.sidebar.expander("\U0001F4CD The listening post", expanded=False):
+    st.map(
+        pd.DataFrame({"lat": [config.LATITUDE], "lon": [config.LONGITUDE]}),
+        zoom=12, size=60, color="#4c9a6a",
+    )
+    st.caption("A window over the Upper West Side — Central Park's Ramble to the "
+               "east, Riverside Park to the west.")
+
 _REFRESH = 10 if live else None
+
+
+def _chorus_note():
+    """A little field-guide flavour that changes with the hour."""
+    h = config.now_local().hour
+    if 5 <= h < 9:
+        return "Dawn chorus — the busiest singing of the day."
+    if 9 <= h < 12:
+        return "Late morning — still good listening."
+    if 12 <= h < 17:
+        return "Afternoon lull — fewer songs, but keep an ear out."
+    if 17 <= h < 20:
+        return "Evening chorus — a second daily peak."
+    return "After dark — owls, and nocturnal migrants passing overhead."
 
 
 # --- Header: summary metric cards ----------------------------------------
@@ -187,7 +252,19 @@ def header_metrics():
     c4.metric("New species this week", new_week)
 
 
-st.title("Birdwatcher")
+st.markdown(
+    f"""
+    <div class="ramble-header">
+        <div class="ramble-kicker">Upper West Side · NYC</div>
+        <div class="ramble-title">\U0001F426 The Ramble Register</div>
+        <div class="ramble-sub">Birdsong heard from a window over the
+            Upper West Side — Central Park &amp; Riverside, NYC.</div>
+        <div class="ramble-note">{_chorus_note()}</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+st.write("")
 header_metrics()
 st.divider()
 
@@ -278,7 +355,7 @@ with stats_tab:
     trend_df = pd.DataFrame({"Detections": [by_day.get(d, 0) for d in span]},
                             index=[d.strftime("%m-%d") for d in span])
     trend_df.index.name = "Day"
-    st.bar_chart(trend_df, color="#4c9a6a")
+    st.bar_chart(trend_df, color="#6fb6c9")
 
     st.markdown("**Species this day**")
     if counts:

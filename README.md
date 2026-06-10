@@ -104,7 +104,8 @@ the desktop doesn't sleep, or it stops recording.
 
 ## Dashboard
 
-The dashboard is a [Streamlit](https://streamlit.io/) app. In a **second
+The dashboard — **The Ramble Register**, styled in a light "Central Park
+Morning" theme — is a [Streamlit](https://streamlit.io/) app. In a **second
 terminal** (leave the listener running in the first), start it:
 
 ```bash

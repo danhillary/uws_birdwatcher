@@ -1,0 +1,9 @@
+# "Central Park Morning" theme for The Ramble Register — fresh, light, parky.
+# Picked up automatically by Streamlit locally and on Posit Connect Cloud.
+[theme]
+base = "light"
+primaryColor = "#4c9a6a"             # meadow green — buttons, accents, sliders
+backgroundColor = "#fbfdfe"          # near-white with a cool hint
+secondaryBackgroundColor = "#eaf4f7" # robin's-egg sky — sidebar, widgets, cards
+textColor = "#1d3b32"                # deep forest, high legibility
+font = "sans serif"
