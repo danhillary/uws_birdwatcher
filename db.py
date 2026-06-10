@@ -1,7 +1,7 @@
 """PostgreSQL storage for bird detections.
 
 One table, `detections`, lives in its own schema (``config.DB_SCHEMA``, default
-``birdwatcher``) so it can share a database with other apps (e.g. CEQR) without
+``birdwatcher``) so it can share a database with other apps without
 colliding. The home listener writes; the cloud dashboard reads.
 
 Timestamps are stored as timezone-naive *local* time (see ``config.now_local``)

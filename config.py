@@ -75,18 +75,18 @@ def today_local():
 # --- Database (Phase 5) --------------------------------------------------
 
 # Postgres connection. Either provide a full SQLAlchemy URL via
-# BW_DATABASE_URL, or the individual DB_* parts (matching the ceqr pattern).
+# BW_DATABASE_URL, or the individual DB_* parts below.
 # Credentials come from the environment / .env only — never commit them.
 DATABASE_URL = os.environ.get("BW_DATABASE_URL")
 
 DB_HOST = os.environ.get("DB_HOST", "localhost")
 DB_PORT = os.environ.get("DB_PORT", "5432")
-DB_NAME = os.environ.get("DB_NAME", "ceqr")
+DB_NAME = os.environ.get("DB_NAME", "birdwatcher")
 DB_USER = os.environ.get("DB_USER", "")
 DB_PASS = os.environ.get("DB_PASS", "")
 
 # Schema that holds the birdwatcher tables, isolated from any other app
-# sharing the database (e.g. CEQR lives in its own schema).
+# that might share the database (each app keeps to its own schema).
 DB_SCHEMA = os.environ.get("BW_DB_SCHEMA", "birdwatcher")
 
 

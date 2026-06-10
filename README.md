@@ -183,7 +183,7 @@ variables:
 | `BW_SAMPLE_RATE`    | `48000`            | Sample rate (BirdNET expects 48 kHz)           |
 | `DB_HOST`           | `localhost`        | PostgreSQL host                                |
 | `DB_PORT`           | `5432`             | PostgreSQL port                                |
-| `DB_NAME`           | `ceqr`             | PostgreSQL database name                       |
+| `DB_NAME`           | `birdwatcher`      | PostgreSQL database name                       |
 | `DB_USER`           | *(empty)*          | PostgreSQL user                                |
 | `DB_PASS`           | *(empty)*          | PostgreSQL password                            |
 | `BW_DATABASE_URL`   | *(empty)*          | Full SQLAlchemy URL (overrides the `DB_*` set) |
