@@ -73,6 +73,35 @@ Each detection is also saved to a PostgreSQL database (in the `birdwatcher`
 schema — see Database below) with a short audio clip in `clips/`. Stop with
 Ctrl-C. To test without live birds, play a birdsong clip near the mic.
 
+### Run it in the background on Windows (autostart on logon)
+
+The listener needs the microphone, which is tied to your interactive Windows
+session — so run it as a **scheduled task in your user session**, not as a
+Windows Service (Session 0 services can't reach the mic).
+
+`run_listener.vbs` (in the repo root) starts the listener hidden and appends its
+output to `listener.log`. Double-click it to start now, or autostart it on logon:
+
+1. Open **Task Scheduler** → **Create Task…** (not "Basic Task").
+2. **General:** name it "Birdwatcher listener"; select **Run only when user is
+   logged on** (this is what gives it microphone access).
+3. **Triggers:** New → **At log on** → (optionally your user). Tick **Enabled**.
+4. **Actions:** New → Program/script: `wscript.exe`; Add arguments:
+   `"C:\path\to\uws_birdwatcher\run_listener.vbs"`.
+5. **Settings:** tick **If the task fails, restart every 1 minute** and **If the
+   running task does not end when requested, force it to stop**; untick **Stop
+   the task if it runs longer than…** so it runs indefinitely.
+6. Save. It launches at every logon; check `listener.log` to confirm detections.
+
+To check it's running: Task Manager → Details → look for `python.exe`. To stop
+it: end that `python.exe` (or disable the task). Also set **Power & sleep** so
+the desktop doesn't sleep, or it stops recording.
+
+> Want it running *before* you log in (e.g. headless reboots)? Either enable
+> Windows auto-login for that account, or use a tool like
+> [NSSM](https://nssm.cc/) to run it as a service — but verify the service can
+> actually access the mic, since Session 0 often can't.
+
 ## Dashboard
 
 The dashboard is a [Streamlit](https://streamlit.io/) app. In a **second

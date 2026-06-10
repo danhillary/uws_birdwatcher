@@ -7,3 +7,4 @@ clips/
 .DS_Store
 .serena/
 .env
+listener.log
