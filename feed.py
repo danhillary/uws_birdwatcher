@@ -15,7 +15,6 @@ Or let the listener call ``publish_safe()`` every loop (throttled to
 """
 import datetime
 import json
-import re
 import time
 import urllib.parse
 import urllib.request
@@ -47,20 +46,18 @@ def _photo(common_name, scientific_name):
             )
             with urllib.request.urlopen(req, timeout=4) as resp:
                 data = json.load(resp)
+            # Use the canonical thumbnail URL as-is. Wikimedia only serves a
+            # fixed set of cached thumbnail widths now; rewriting the width to
+            # an arbitrary value (e.g. 640px) returns HTTP 400. The widget's
+            # dark gradient keeps this ~330px image perfectly legible.
             thumb = (data.get("thumbnail") or {}).get("source")
             if thumb:
-                found = _upscale(thumb)
+                found = thumb
                 break
         except Exception:
             continue
     _PHOTO_CACHE[key] = found
     return found
-
-
-def _upscale(url, width=640):
-    """Wikimedia thumbnail URLs embed a pixel width like '/330px-name.jpg'.
-    Bump it up for a crisper widget background; non-matching URLs pass through."""
-    return re.sub(r"/\d+px-", f"/{width}px-", url)
 
 
 def _humanize_age(seconds):
