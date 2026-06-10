@@ -98,3 +98,21 @@ def database_url():
     if DB_PASS:
         auth = f"{DB_USER}:{DB_PASS}"
     return f"postgresql+psycopg2://{auth}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+
+# --- iPhone widget feed (optional) ---------------------------------------
+
+# When BW_FEED_S3_BUCKET is set, the listener publishes a small public JSON
+# file (latest detection, today's totals, listener health) to S3 so a phone
+# widget can read it without ever touching the database. Leave the bucket empty
+# to disable the feed entirely. AWS credentials come from the standard
+# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars (or an AWS profile).
+FEED_S3_BUCKET = os.environ.get("BW_FEED_S3_BUCKET", "")
+FEED_S3_KEY = os.environ.get("BW_FEED_S3_KEY", "birdwatcher/latest.json")
+FEED_S3_REGION = os.environ.get("BW_FEED_S3_REGION", "")
+# Only set this if the bucket still uses ACLs (e.g. "public-read"). Buckets with
+# "Bucket owner enforced" object ownership reject ACLs — use a bucket policy for
+# public read instead and leave this empty.
+FEED_S3_ACL = os.environ.get("BW_FEED_S3_ACL", "")
+# Minimum seconds between feed publishes (the listener loops faster than this).
+FEED_INTERVAL = int(os.environ.get("BW_FEED_INTERVAL", "60"))

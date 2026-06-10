@@ -16,6 +16,7 @@ import sounddevice as sd
 
 import config
 import db
+import feed
 import storage
 from analysis import BirdAnalyzer, dedupe_per_species
 
@@ -120,6 +121,9 @@ def main():
                 db.record_heartbeat(host, peak, last_det)
             except Exception as e:
                 print(f"   (heartbeat write failed: {e})")
+
+            # Refresh the public widget feed (throttled, no-op if disabled).
+            feed.publish_safe()
 
             if peak < 1e-4:
                 print(f"[{config.now_local():%H:%M:%S}] (silence — check the mic)")

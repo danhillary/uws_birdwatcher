@@ -133,6 +133,60 @@ The listener and dashboard share the same database, so the dashboard updates as
 new birds are detected. Audio-clip playback works on the machine that recorded
 the clips (the files stay local).
 
+## iPhone widget (optional)
+
+A Scriptable widget can show the **latest bird** — its photo, when it was heard,
+today's tally, and a listener-health dot — right on your home or lock screen.
+
+It reads a small public JSON file the listener publishes to S3, so the phone
+never touches the database. The feature is **off unless `BW_FEED_S3_BUCKET` is
+set** (see Configuration).
+
+**1. Make an S3 home for the feed.** Create a bucket (or reuse one) and decide a
+key like `birdwatcher/latest.json`. The object must be **publicly readable**.
+Modern buckets disable ACLs, so add a bucket policy granting public read to that
+prefix:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "PublicReadBirdwatcherFeed",
+    "Effect": "Allow",
+    "Principal": "*",
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::YOUR-BUCKET/birdwatcher/*"
+  }]
+}
+```
+
+**2. Give the listener AWS credentials** with `s3:PutObject` on that prefix. Add
+to the listener's `.env`:
+
+```
+BW_FEED_S3_BUCKET=YOUR-BUCKET
+BW_FEED_S3_REGION=us-east-1
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+```
+
+Install boto3 (it's in `requirements-listen.txt`). Test it once:
+
+```bash
+# Windows:  .venv\Scripts\python -m feed
+# macOS:    .venv/bin/python -m feed
+```
+
+That prints the JSON and uploads it. Confirm the public URL loads in a browser:
+`https://YOUR-BUCKET.s3.amazonaws.com/birdwatcher/latest.json`. From then on the
+running listener refreshes it about once a minute (`BW_FEED_INTERVAL`).
+
+**3. Add the widget.** Install **[Scriptable](https://scriptable.app)** (free) on
+the iPhone, create a new script, and paste in `widget/RambleRegister.js`. Set
+`FEED_URL` at the top to your public URL, run it once to grant network access,
+then long-press the home screen → ＋ → Scriptable → add a **Medium** widget and
+point it at the script. (Full setup notes are in the file's header.)
+
 ## Database
 
 Detections are stored in **PostgreSQL**, in a dedicated `birdwatcher` schema so
@@ -198,6 +252,11 @@ variables:
 | `BW_TIMEZONE`       | `America/New_York` | Local TZ for "today"/hourly buckets            |
 | `BW_CLIPS_DIR`      | `clips/`           | Folder for saved audio clips                   |
 | `BW_MAX_CLIPS_MB`   | `2000`             | Clip storage cap; oldest clips pruned over it  |
+| `BW_FEED_S3_BUCKET` | *(empty)*          | S3 bucket for the iPhone-widget feed; empty = off |
+| `BW_FEED_S3_KEY`    | `birdwatcher/latest.json` | S3 key for the published JSON feed      |
+| `BW_FEED_S3_REGION` | *(empty)*          | AWS region for the feed bucket                 |
+| `BW_FEED_S3_ACL`    | *(empty)*          | S3 ACL (e.g. `public-read`); omit if ACLs disabled |
+| `BW_FEED_INTERVAL`  | `60`               | Min seconds between feed publishes             |
 
 Example (PowerShell): `$env:BW_INPUT_DEVICE="UAC"; .venv\Scripts\python -m capture.listen`
 
@@ -211,10 +270,13 @@ config.py              # central config (location, mic, thresholds, DB, timezone
 analysis.py            # reusable BirdNET wrapper
 db.py                  # PostgreSQL storage + queries (SQLAlchemy)
 storage.py             # clip saving + storage-cap pruning
+feed.py                # publishes the iPhone-widget JSON feed to S3 (optional)
 streamlit_app.py       # Streamlit dashboard (also the Connect Cloud primary file)
 capture/
   list_devices.py      # list microphones
   listen.py            # record -> identify -> save to DB + clips
+widget/
+  RambleRegister.js    # Scriptable iPhone widget (reads the S3 feed)
 requirements.txt       # slim dashboard deps (Connect Cloud installs these)
 requirements-listen.txt# adds the BirdNET + microphone stack (home machine only)
 .env.example           # template for DB credentials (copy to .env)

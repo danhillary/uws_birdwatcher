@@ -7,3 +7,4 @@ tensorflow
 sounddevice
 soundfile
 numpy
+boto3  # only needed if you publish the iPhone-widget feed to S3 (optional)
