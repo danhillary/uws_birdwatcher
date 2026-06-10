@@ -164,3 +164,30 @@ def distinct_days(conn):
         text(f"SELECT DISTINCT detected_at::date AS d FROM {_TABLE} ORDER BY d DESC")
     ).mappings().all()
     return [r["d"].isoformat() for r in rows]
+
+
+def overview(conn):
+    """All-time totals for the dashboard's summary cards."""
+    row = conn.execute(text(f"""
+        SELECT COUNT(*)                    AS total,
+               COUNT(DISTINCT common_name) AS species,
+               MIN(detected_at)            AS first_at,
+               MAX(detected_at)            AS last_at
+        FROM {_TABLE}
+    """)).mappings().first()
+    return dict(row) if row else {
+        "total": 0, "species": 0, "first_at": None, "last_at": None,
+    }
+
+
+def detections_per_day(conn, days=14):
+    """Daily detection counts for the last `days` days (for a trend chart)."""
+    start = (config.today_local() - datetime.timedelta(days=days - 1)).isoformat()
+    rows = conn.execute(text(f"""
+        SELECT detected_at::date AS day, COUNT(*) AS n
+        FROM {_TABLE}
+        WHERE detected_at::date >= CAST(:start AS date)
+        GROUP BY day
+        ORDER BY day
+    """), {"start": start}).mappings().all()
+    return [dict(r) for r in rows]
