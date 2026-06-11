@@ -13,6 +13,7 @@ import os
 import sys
 import urllib.parse
 import urllib.request
+import uuid
 
 # Ensure local modules (config, db) are importable regardless of how the host
 # launches this script. Posit Connect Cloud doesn't always put the project root
@@ -362,6 +363,72 @@ def _conf_col(label="Confidence"):
         label, min_value=0, max_value=100, format="%d%%")}
 
 
+# --- Live-feed cards + clip voting ---------------------------------------
+
+# Most recent detections shown as cards. Kept modest because each card mounts an
+# audio element and two buttons; the table tabs still cover the full history.
+_FEED_LIMIT = 30
+
+# A stable per-browser-session token so a visitor's repeated votes overwrite
+# their own earlier vote instead of stacking. Not a login — just enough to avoid
+# accidental double-counting within a session.
+if "voter" not in st.session_state:
+    st.session_state.voter = uuid.uuid4().hex
+if "vote_error" not in st.session_state:
+    st.session_state.vote_error = False
+
+
+def _cast_vote(detection_id, vote, current):
+    """Record or withdraw a vote. Clicking the choice you already made withdraws
+    it (vote 0). Sets a flag instead of crashing if the DB user can't write."""
+    new = 0 if current == vote else vote
+    try:
+        db.record_vote(detection_id, st.session_state.voter, new)
+        st.session_state.vote_error = False
+    except SQLAlchemyError:
+        st.session_state.vote_error = True  # read-only DB user, almost always
+
+
+def _detection_card(r, tally, mine):
+    """One detection as a bordered card: photo, name, time/confidence, the clip
+    player, and up/down vote buttons with a 'Disputed' flag past the threshold."""
+    up, down = tally.get("up", 0), tally.get("down", 0)
+    disputed = (up + down) > 0 and (up - down) <= config.DISPUTED_THRESHOLD
+    did = r.get("id")
+    with st.container(border=True):
+        if show_photos:
+            pcol, head = st.columns([1, 5], vertical_alignment="center")
+            photo = species_photo(r["common_name"], r["scientific_name"])
+            if photo:
+                pcol.image(photo, width=72)
+        else:
+            head = st.container()
+        head.markdown(f"#### \U0001F426 {r['common_name']}")
+        meta = (f"{_fmt_time(r['detected_at'])} · "
+                f"{int(r['confidence'] * 100)}% confidence")
+        if disputed:
+            meta += "  ·  :red[**Disputed ⚠**]"
+        head.caption(meta)
+
+        src = _clip_src(r)
+        if src:
+            st.audio(src)
+        else:
+            st.caption("_clip unavailable_")
+
+        c_up, c_down, _rest = st.columns([1, 1, 4])
+        if c_up.button(f"\U0001F44D {up}", key=f"up_{did}", width="stretch",
+                       type="primary" if mine == 1 else "secondary",
+                       help="This clip matches the species"):
+            _cast_vote(did, 1, mine)
+            st.rerun(scope="fragment")
+        if c_down.button(f"\U0001F44E {down}", key=f"down_{did}", width="stretch",
+                         type="primary" if mine == -1 else "secondary",
+                         help="This clip doesn't match the species"):
+            _cast_vote(did, -1, mine)
+            st.rerun(scope="fragment")
+
+
 # --- Tabs ----------------------------------------------------------------
 
 feed_tab, stats_tab, life_tab = st.tabs(["Live feed", "Daily stats", "Life list"])
@@ -369,34 +436,25 @@ feed_tab, stats_tab, life_tab = st.tabs(["Live feed", "Daily stats", "Life list"
 with feed_tab:
     st.subheader("Live feed")
 
+    st.caption("Tap \U0001F44D / \U0001F44E to tell us whether a clip matches the bird.")
+
     @st.fragment(run_every=_REFRESH)
     def live_feed():
-        rows = load_recent(100)
+        rows = load_recent(_FEED_LIMIT)
         if not rows:
             st.info("No detections yet. Start the listener "
                     "(`python -m capture.listen`) and play some birdsong near "
                     "the mic.")
             return
-        records = [
-            {
-                "Photo": species_photo(r["common_name"], r["scientific_name"])
-                if show_photos else None,
-                "Time": _fmt_time(r["detected_at"]),
-                "Species": r["common_name"],
-                "Scientific name": r["scientific_name"],
-                "Confidence": int(r["confidence"] * 100),
-            }
-            for r in rows
-        ]
-        _species_table(records, _conf_col())
-
-        clips = [(r, _clip_src(r)) for r in rows]
-        clips = [(r, src) for r, src in clips if src]
-        if clips:
-            st.caption("Recent clips")
-            for r, src in clips[:10]:
-                st.write(f"{_fmt_time(r['detected_at'])} — **{r['common_name']}**")
-                st.audio(src)
+        ids = [r.get("id") for r in rows]
+        tallies = _read(db.vote_tallies, ids, default={}) or {}
+        mine = _read(db.my_votes, st.session_state.voter, ids, default={}) or {}
+        if st.session_state.vote_error:
+            st.warning("Voting is unavailable — the dashboard's database user "
+                       "is read-only.")
+        for r in rows:
+            did = r.get("id")
+            _detection_card(r, tallies.get(did, {}), mine.get(did, 0))
 
     live_feed()
 

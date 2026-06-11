@@ -144,6 +144,20 @@ segment's clips are **kept on the recording machine only** and never uploaded to
 the public bucket — the bird detection is still recorded, just without cloud
 audio. Tune `BW_HUMAN_VOICE_CONF` (default `0.3`) lower to be stricter.
 
+### Clip voting (crowd checking)
+
+The live feed shows each recent detection as a card with its clip and 👍 / 👎
+buttons, so visitors can flag clips that don't match the species (e.g. a
+jackhammer logged as a woodpecker). Votes are stored per browser session (one
+vote each, changeable); a detection whose net score drops to
+`BW_DISPUTED_THRESHOLD` (default `-3`) is labelled **Disputed ⚠** in the feed but
+never auto-deleted.
+
+Voting **writes** to the database, so the dashboard's DB user needs
+`INSERT`/`UPDATE` on the `birdwatcher` schema (the `clip_votes` table is created
+by `init_db`). With a read-only user, the feed still works and just shows a
+"voting unavailable" note.
+
 ## iPhone widget (optional)
 
 A Scriptable widget can show the **latest bird** — its photo, when it was heard,
@@ -273,6 +287,7 @@ variables:
 | `BW_CLIPS_S3_PREFIX`| `birdwatcher/clips`| S3 key prefix for uploaded clips               |
 | `BW_FILTER_HUMAN_VOICE` | `1`            | Keep clips with a human voice off the public bucket |
 | `BW_HUMAN_VOICE_CONF` | `0.3`            | Confidence at which a human voice triggers the hold |
+| `BW_DISPUTED_THRESHOLD` | `-3`           | Net clip-vote score at/below which a detection is flagged "Disputed" |
 
 Example (PowerShell): `$env:BW_INPUT_DEVICE="UAC"; .venv\Scripts\python -m capture.listen`
 
