@@ -365,9 +365,52 @@ def _conf_col(label="Confidence"):
 
 # --- Live-feed cards + clip voting ---------------------------------------
 
-# Most recent detections shown as cards. Kept modest because each card mounts an
-# audio element and two buttons; the table tabs still cover the full history.
-_FEED_LIMIT = 30
+# We pull a generous window of recent rows, then collapse back-to-back repeats of
+# the same species into single cards (a resident bird can otherwise fill the whole
+# feed). _FEED_FETCH is how many raw detections we read; _FEED_CARDS caps how many
+# collapsed cards we render (each mounts an audio element and two buttons).
+_FEED_FETCH = 150
+_FEED_CARDS = 30
+
+
+def _group_consecutive(rows):
+    """Collapse back-to-back detections of the same species into one group.
+
+    ``rows`` is newest-first (as ``db.recent_detections`` returns them). Each
+    maximal run of consecutive same-species rows becomes one group whose
+    representative is the run's *highest-confidence* detection — that clip,
+    confidence and id are what the card shows and what votes apply to. A species
+    that goes quiet and returns later forms a separate group, so the feed stays a
+    true chronological timeline rather than an all-time leaderboard.
+
+    Returns a list of dicts: {key, rep (row), count, start, end (datetimes)}."""
+    groups = []
+    for r in rows:
+        key = r.get("scientific_name") or r.get("common_name")
+        ts = r.get("detected_at")
+        if groups and groups[-1]["key"] == key:
+            g = groups[-1]
+            g["count"] += 1
+            if ts is not None:
+                if g["start"] is None or ts < g["start"]:
+                    g["start"] = ts
+                if g["end"] is None or ts > g["end"]:
+                    g["end"] = ts
+            if (r.get("confidence") or 0) > (g["rep"].get("confidence") or 0):
+                g["rep"] = r
+        else:
+            groups.append({"key": key, "rep": r, "count": 1,
+                           "start": ts, "end": ts})
+    return groups
+
+
+def _group_time_label(group):
+    """Time text for a group's card: a single time for one detection, or an
+    earliest–latest range when consecutive repeats were collapsed."""
+    if group["count"] > 1 and group["start"] is not None and group["end"] is not None:
+        a, b = _fmt_time(group["start"]), _fmt_time(group["end"])
+        return a if a == b else f"{a}–{b}"
+    return _fmt_time(group["rep"].get("detected_at"))
 
 # A stable per-browser-session token so a visitor's repeated votes overwrite
 # their own earlier vote instead of stacking. Not a login — just enough to avoid
@@ -389,9 +432,13 @@ def _cast_vote(detection_id, vote, current):
         st.session_state.vote_error = True  # read-only DB user, almost always
 
 
-def _detection_card(r, tally, mine):
-    """One detection as a bordered card: photo, name, time/confidence, the clip
-    player, and up/down vote buttons with a 'Disputed' flag past the threshold."""
+def _detection_card(group, tally, mine):
+    """One species group as a bordered card: photo, name (with a ×N badge when
+    consecutive repeats were collapsed), the time/best-confidence line, the
+    representative clip, and up/down vote buttons with a 'Disputed' flag past the
+    threshold. Votes apply to the run's highest-confidence detection."""
+    r = group["rep"]
+    count = group["count"]
     up, down = tally.get("up", 0), tally.get("down", 0)
     disputed = (up + down) > 0 and (up - down) <= config.DISPUTED_THRESHOLD
     did = r.get("id")
@@ -403,9 +450,13 @@ def _detection_card(r, tally, mine):
                 pcol.image(photo, width=72)
         else:
             head = st.container()
-        head.markdown(f"#### \U0001F426 {r['common_name']}")
-        meta = (f"{_fmt_time(r['detected_at'])} · "
-                f"{int(r['confidence'] * 100)}% confidence")
+        title = f"#### \U0001F426 {r['common_name']}"
+        if count > 1:
+            title += f"  `×{count}`"
+        head.markdown(title)
+        conf = int(r["confidence"] * 100)
+        meta = (f"{_group_time_label(group)} · "
+                f"{conf}% confidence{' (best)' if count > 1 else ''}")
         if disputed:
             meta += "  ·  :red[**Disputed ⚠**]"
         head.caption(meta)
@@ -436,25 +487,28 @@ feed_tab, stats_tab, life_tab = st.tabs(["Live feed", "Daily stats", "Life list"
 with feed_tab:
     st.subheader("Live feed")
 
-    st.caption("Tap \U0001F44D / \U0001F44E to tell us whether a clip matches the bird.")
+    st.caption("Back-to-back repeats of the same species are grouped into one "
+               "card (best clip shown). Tap \U0001F44D / \U0001F44E to tell us "
+               "whether a clip matches the bird.")
 
     @st.fragment(run_every=_REFRESH)
     def live_feed():
-        rows = load_recent(_FEED_LIMIT)
+        rows = load_recent(_FEED_FETCH)
         if not rows:
             st.info("No detections yet. Start the listener "
                     "(`python -m capture.listen`) and play some birdsong near "
                     "the mic.")
             return
-        ids = [r.get("id") for r in rows]
+        groups = _group_consecutive(rows)[:_FEED_CARDS]
+        ids = [g["rep"].get("id") for g in groups]
         tallies = _read(db.vote_tallies, ids, default={}) or {}
         mine = _read(db.my_votes, st.session_state.voter, ids, default={}) or {}
         if st.session_state.vote_error:
             st.warning("Voting is unavailable — the dashboard's database user "
                        "is read-only.")
-        for r in rows:
-            did = r.get("id")
-            _detection_card(r, tallies.get(did, {}), mine.get(did, 0))
+        for g in groups:
+            did = g["rep"].get("id")
+            _detection_card(g, tallies.get(did, {}), mine.get(did, 0))
 
     live_feed()
 
