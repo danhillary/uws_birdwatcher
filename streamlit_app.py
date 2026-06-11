@@ -139,6 +139,19 @@ def load_status():
     return _read(db.listener_status, default=None)
 
 
+def _wiki_json(path_title, endpoint="summary"):
+    """Fetch a Wikipedia REST JSON document for a page title, or {} on any
+    failure. ``endpoint`` is 'summary' (page text/thumbnail/link) or
+    'media-list' (images and audio on the page)."""
+    url = (f"https://en.wikipedia.org/api/rest_v1/page/{endpoint}/"
+           + urllib.parse.quote(path_title.replace(" ", "_")))
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "uws_birdwatcher/1.0 (hobby project)"}
+    )
+    with urllib.request.urlopen(req, timeout=4) as resp:
+        return json.load(resp)
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def species_photo(common_name, scientific_name):
     """Thumbnail URL for a species from Wikipedia, or None. Cached a day.
@@ -148,19 +161,51 @@ def species_photo(common_name, scientific_name):
         if not title:
             continue
         try:
-            url = ("https://en.wikipedia.org/api/rest_v1/page/summary/"
-                   + urllib.parse.quote(title.replace(" ", "_")))
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "uws_birdwatcher/1.0 (hobby project)"}
-            )
-            with urllib.request.urlopen(req, timeout=4) as resp:
-                data = json.load(resp)
+            data = _wiki_json(title)
             thumb = (data.get("thumbnail") or {}).get("source")
             if thumb:
                 return thumb
         except Exception:
             continue
     return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def species_reference(common_name, scientific_name):
+    """A Wikipedia page link and a reference song recording for a species, so a
+    voter can compare our clip against a known example before voting. Returns
+    {"page": url|None, "audio": url|None}; any failure yields empty fields.
+    Cached a day.
+
+    The audio is whatever recording the species' Wikipedia page carries
+    (typically a Xeno-canto clip hosted on Wikimedia Commons). It's usually Ogg,
+    which plays in Chrome/Firefox/Android; Safari/iOS users can use the link
+    instead. We resolve the page's File: title to a playable URL via Wikimedia's
+    Special:FilePath redirect."""
+    out = {"page": None, "audio": None}
+    for title in (common_name, scientific_name):
+        if not title:
+            continue
+        try:
+            if not out["page"]:
+                summ = _wiki_json(title, "summary")
+                out["page"] = (((summ.get("content_urls") or {}).get("desktop")
+                                or {}).get("page"))
+            if not out["audio"]:
+                ml = _wiki_json(title, "media-list")
+                for m in ml.get("items", []):
+                    name = m.get("title", "")
+                    if m.get("type") == "audio" and name.startswith("File:"):
+                        fn = name.split("File:", 1)[1]
+                        out["audio"] = (
+                            "https://commons.wikimedia.org/wiki/Special:FilePath/"
+                            + urllib.parse.quote(fn))
+                        break
+        except Exception:
+            pass
+        if out["page"] and out["audio"]:
+            break
+    return out
 
 
 # --- Formatting helpers --------------------------------------------------
@@ -466,6 +511,24 @@ def _detection_card(group, tally, mine):
             st.audio(src)
         else:
             st.caption("_clip unavailable_")
+
+        # Field-guide context so voters have something to judge against: a link
+        # to read about the bird, and a known reference recording to compare with
+        # the clip above. A keyed toggle (not an expander) keeps the reference
+        # open across the feed's 10s auto-refresh.
+        ref = species_reference(r["common_name"], r["scientific_name"])
+        if ref.get("page"):
+            st.markdown(f"[\U0001F4D6 About the {r['common_name']} "
+                        f"↗]({ref['page']})")
+        if ref.get("audio"):
+            if st.toggle("\U0001F50A Hear a reference recording",
+                         key=f"ref_{did}",
+                         help="A known example of this species — compare it with "
+                              "the clip above before you vote."):
+                st.audio(ref["audio"])
+                st.caption("Reference recording via Wikimedia Commons · "
+                           f"[open ↗]({ref['audio']}) (Ogg — use the link on "
+                           "Safari/iOS).")
 
         c_up, c_down, _rest = st.columns([1, 1, 4])
         if c_up.button(f"\U0001F44D {up}", key=f"up_{did}", width="stretch",
