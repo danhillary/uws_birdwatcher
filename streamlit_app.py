@@ -210,6 +210,14 @@ def _local_clip(name):
     return path if os.path.isfile(path) else None
 
 
+def _clip_src(r):
+    """A playable audio source for a detection. Prefer the public S3 URL — it
+    works anywhere, including the cloud-hosted dashboard — and fall back to the
+    local file on the recording machine. None when neither is available (e.g. a
+    clip withheld for privacy, or one not yet uploaded)."""
+    return r.get("clip_url") or _local_clip(r.get("clip_path"))
+
+
 # --- Sidebar -------------------------------------------------------------
 
 st.sidebar.title("\U0001F426 The Ramble Register")
@@ -382,13 +390,13 @@ with feed_tab:
         ]
         _species_table(records, _conf_col())
 
-        clips = [(r, _local_clip(r["clip_path"])) for r in rows]
-        clips = [(r, p) for r, p in clips if p]
+        clips = [(r, _clip_src(r)) for r in rows]
+        clips = [(r, src) for r, src in clips if src]
         if clips:
-            st.caption("Recent clips (available on the recording machine)")
-            for r, path in clips[:10]:
+            st.caption("Recent clips")
+            for r, src in clips[:10]:
                 st.write(f"{_fmt_time(r['detected_at'])} — **{r['common_name']}**")
-                st.audio(path)
+                st.audio(src)
 
     live_feed()
 

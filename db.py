@@ -63,8 +63,10 @@ def init_db():
         confidence      DOUBLE PRECISION NOT NULL,
         lat             DOUBLE PRECISION,
         lon             DOUBLE PRECISION,
-        clip_path       TEXT
+        clip_path       TEXT,
+        clip_url        TEXT
     );
+    ALTER TABLE {_TABLE} ADD COLUMN IF NOT EXISTS clip_url TEXT;
     CREATE INDEX IF NOT EXISTS idx_bw_detected_at ON {_TABLE} (detected_at);
     CREATE INDEX IF NOT EXISTS idx_bw_common_name ON {_TABLE} (common_name);
     CREATE TABLE IF NOT EXISTS {_STATUS} (
@@ -80,20 +82,24 @@ def init_db():
 
 
 def insert_detection(detected_at, common_name, scientific_name,
-                     confidence, lat, lon, clip_path):
-    """Insert one detection. Opens and commits its own transaction."""
+                     confidence, lat, lon, clip_path, clip_url=None):
+    """Insert one detection. Opens and commits its own transaction.
+
+    ``clip_path`` is the local filename on the recording machine; ``clip_url``
+    is the public S3 URL when the clip was uploaded for the cloud dashboard
+    (None when uploads are off, failed, or the clip was withheld for privacy)."""
     if isinstance(detected_at, datetime.datetime):
         detected_at = detected_at.replace(microsecond=0, tzinfo=None)
     with get_engine().begin() as conn:
         row = conn.execute(
             text(f"""INSERT INTO {_TABLE}
-                (detected_at, common_name, scientific_name, confidence, lat, lon, clip_path)
-                VALUES (:detected_at, :common_name, :scientific_name, :confidence, :lat, :lon, :clip_path)
+                (detected_at, common_name, scientific_name, confidence, lat, lon, clip_path, clip_url)
+                VALUES (:detected_at, :common_name, :scientific_name, :confidence, :lat, :lon, :clip_path, :clip_url)
                 RETURNING id"""),
             {
                 "detected_at": detected_at, "common_name": common_name,
                 "scientific_name": scientific_name, "confidence": float(confidence),
-                "lat": lat, "lon": lon, "clip_path": clip_path,
+                "lat": lat, "lon": lon, "clip_path": clip_path, "clip_url": clip_url,
             },
         ).first()
     return row[0] if row else None
@@ -127,12 +133,15 @@ def record_heartbeat(host, last_peak, last_detection_at=None):
 
 
 def clear_clip_paths(filenames):
-    """Null out clip_path for clips that have been pruned from disk."""
+    """Null out clip_path *and* clip_url for clips pruned from disk. The S3 copy
+    is deleted in lock-step (see clips_s3.delete_many), so neither the local nor
+    the cloud player should point at audio that no longer exists."""
     if not filenames:
         return
     with get_engine().begin() as conn:
         conn.execute(
-            text(f"UPDATE {_TABLE} SET clip_path = NULL WHERE clip_path = :f"),
+            text(f"UPDATE {_TABLE} SET clip_path = NULL, clip_url = NULL "
+                 f"WHERE clip_path = :f"),
             [{"f": f} for f in filenames],
         )
 
