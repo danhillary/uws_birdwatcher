@@ -140,6 +140,27 @@ def record_heartbeat(host, last_peak, last_detection_at=None):
         )
 
 
+def detections_needing_clip_url(conn):
+    """Rows that have a local clip on disk but no S3 URL yet — the backfill
+    candidates. Returns id, timestamp, names, and clip_path so the backfill can
+    locate the file and (optionally) voice-check it before uploading."""
+    return _rows(conn.execute(
+        text(f"""SELECT id, detected_at, common_name, scientific_name, clip_path
+                 FROM {_TABLE}
+                 WHERE clip_path IS NOT NULL AND clip_url IS NULL
+                 ORDER BY detected_at""")
+    ))
+
+
+def set_clip_url(detection_id, url):
+    """Record the public S3 URL for one detection after a backfill upload."""
+    with get_engine().begin() as conn:
+        conn.execute(
+            text(f"UPDATE {_TABLE} SET clip_url = :u WHERE id = :id"),
+            {"u": url, "id": detection_id},
+        )
+
+
 def clear_clip_paths(filenames):
     """Null out clip_path *and* clip_url for clips pruned from disk. The S3 copy
     is deleted in lock-step (see clips_s3.delete_many), so neither the local nor
