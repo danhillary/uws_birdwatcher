@@ -1,5 +1,6 @@
 """Central configuration. Override any value with an environment variable."""
 import datetime
+import json
 import os
 from zoneinfo import ZoneInfo
 
@@ -17,8 +18,47 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 LATITUDE = float(os.environ.get("BW_LAT", "40.785"))
 LONGITUDE = float(os.environ.get("BW_LON", "-73.975"))
 
-# Minimum confidence (0-1) for a detection to be reported.
-MIN_CONFIDENCE = float(os.environ.get("BW_MIN_CONF", "0.25"))
+# Minimum confidence (0-1) for a detection to be reported. The bar is set
+# fairly high because a single mic in a noisy urban setting (traffic,
+# construction, sirens) throws a lot of low-confidence guesses; below ~0.5
+# most of them are noise rather than birds.
+MIN_CONFIDENCE = float(os.environ.get("BW_MIN_CONF", "0.5"))
+
+# Per-species confidence overrides. Some species are chronically faked by city
+# noise: woodpecker "drumming" is acoustically almost identical to a jackhammer
+# or a hammer on a construction site, so we demand a much higher bar before
+# believing one. Keys are matched as case-insensitive *substrings* of the
+# common name, so "woodpecker" covers Downy/Hairy/Red-bellied/etc. in one line.
+# Extend or override the map with BW_SPECIES_MIN_CONF as a JSON object, e.g.
+#   BW_SPECIES_MIN_CONF='{"woodpecker": 0.8, "mourning dove": 0.6}'
+# (env entries merge over these defaults; set a species to 0 to opt it out).
+SPECIES_MIN_CONF = {
+    "woodpecker": 0.7,   # vs. jackhammers / hammering on a construction site
+    "flicker": 0.7,      # Northern Flicker drums too
+    "sapsucker": 0.7,    # ditto
+}
+_species_env = os.environ.get("BW_SPECIES_MIN_CONF")
+if _species_env:
+    SPECIES_MIN_CONF = {
+        **SPECIES_MIN_CONF,
+        **{k.lower(): float(v) for k, v in json.loads(_species_env).items()},
+    }
+
+
+def species_min_conf(common_name):
+    """The confidence threshold for one species: the strictest per-species
+    override whose key appears in the common name, else MIN_CONFIDENCE."""
+    name = (common_name or "").lower()
+    overrides = [t for key, t in SPECIES_MIN_CONF.items() if key in name]
+    return max(overrides) if overrides else MIN_CONFIDENCE
+
+
+def analysis_floor():
+    """The lowest confidence worth asking BirdNET for. We post-filter per
+    species, so BirdNET itself must return everything at or above the *lowest*
+    threshold in play — otherwise a species with a below-global override would
+    be dropped before we ever see it."""
+    return min([MIN_CONFIDENCE, *SPECIES_MIN_CONF.values()])
 
 # Audio capture settings. BirdNET expects 48 kHz mono.
 SAMPLE_RATE = int(os.environ.get("BW_SAMPLE_RATE", "48000"))

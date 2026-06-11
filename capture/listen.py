@@ -18,7 +18,7 @@ import config
 import db
 import feed
 import storage
-from analysis import BirdAnalyzer, dedupe_per_species
+from analysis import BirdAnalyzer, dedupe_per_species, filter_by_confidence
 
 
 def resolve_device(spec):
@@ -100,7 +100,8 @@ def main():
         f"Listening on '{info['name']}' "
         f"@ {config.SAMPLE_RATE} Hz, {config.SEGMENT_SECONDS}s segments.\n"
         f"Location: {config.LATITUDE}, {config.LONGITUDE} | "
-        f"min confidence: {config.MIN_CONFIDENCE}\n"
+        f"min confidence: {config.MIN_CONFIDENCE} "
+        f"({len(config.SPECIES_MIN_CONF)} per-species overrides)\n"
         f"Saving to: {config.DB_HOST}/{config.DB_NAME} (schema {config.DB_SCHEMA})\n"
         f"Press Ctrl-C to stop.\n"
     )
@@ -131,7 +132,9 @@ def main():
 
             when = config.now_local()
             detections = dedupe_per_species(
-                analyzer.analyze(audio, config.SAMPLE_RATE, when=when)
+                filter_by_confidence(
+                    analyzer.analyze(audio, config.SAMPLE_RATE, when=when)
+                )
             )
 
             stamp = f"{when:%H:%M:%S}"

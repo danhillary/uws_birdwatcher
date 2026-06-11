@@ -35,10 +35,22 @@ class BirdAnalyzer:
             lat=config.LATITUDE,
             lon=config.LONGITUDE,
             date=when,
-            min_conf=config.MIN_CONFIDENCE,
+            # Ask for everything down to the lowest threshold in play; we apply
+            # the real per-species bar afterwards (see filter_by_confidence).
+            min_conf=config.analysis_floor(),
         )
         recording.analyze()
         return recording.detections
+
+
+def filter_by_confidence(detections):
+    """Drop detections that fall below their species' confidence threshold.
+
+    Most species use the global MIN_CONFIDENCE, but noise-prone ones carry a
+    higher bar (a "woodpecker" at 0.55 is far more likely a jackhammer than a
+    bird) — see config.SPECIES_MIN_CONF / config.species_min_conf."""
+    return [d for d in detections
+            if d["confidence"] >= config.species_min_conf(d["common_name"])]
 
 
 def dedupe_per_species(detections):
