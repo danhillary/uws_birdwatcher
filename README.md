@@ -118,7 +118,11 @@ terminal** (leave the listener running in the first), start it:
 
 Streamlit opens **http://localhost:8501** automatically. Three tabs:
 
-- **Live feed** — most recent detections, auto-refreshing, with playable clips
+- **Live feed** — most recent detections as auto-refreshing cards, each with a
+  playable clip, a link to read about the bird, a reference recording to compare
+  against, and 👍 / 👎 voting (see *Clip voting* below). Back-to-back repeats of
+  the same species are grouped into one card (e.g. *Northern Cardinal ×9*) so a
+  chatty resident bird doesn't crowd everything else out.
 - **Daily stats** — per-species counts and an activity-by-hour chart (pick a day)
 - **Life list** — every species ever heard, first/last heard, totals
 
@@ -152,6 +156,13 @@ jackhammer logged as a woodpecker). Votes are stored per browser session (one
 vote each, changeable); a detection whose net score drops to
 `BW_DISPUTED_THRESHOLD` (default `-3`) is labelled **Disputed ⚠** in the feed but
 never auto-deleted.
+
+To help voters judge, each card also links to the bird's **Wikipedia page** and
+offers a **reference recording** of the species to compare against the clip. Both
+come from Wikipedia (the same keyless source used for the species photos), so
+they need no extra credentials. The reference audio is usually an Ogg file —
+it plays in Chrome/Firefox/Android, and the card includes an "open" link as a
+fallback for Safari/iOS, which don't play Ogg.
 
 Voting **writes** to the database, so the dashboard's DB user needs
 `INSERT`/`UPDATE` on the `birdwatcher` schema (the `clip_votes` table is created
