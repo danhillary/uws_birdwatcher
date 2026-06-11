@@ -209,7 +209,8 @@ running listener refreshes it about once a minute (`BW_FEED_INTERVAL`).
 
 **3. Add the widget.** Install **[Scriptable](https://scriptable.app)** (free) on
 the iPhone, create a new script, and paste in `widget/RambleRegister.js`. Set
-`FEED_URL` at the top to your public URL, run it once to grant network access,
+`FEED_URL` at the top to your public URL and `DASHBOARD_URL` to your dashboard's
+address (so tapping the widget opens it), run it once to grant network access,
 then long-press the home screen → ＋ → Scriptable → add a **Medium** widget and
 point it at the script. (Full setup notes are in the file's header.)
 
