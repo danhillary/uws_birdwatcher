@@ -23,7 +23,10 @@ def save_clip(audio, sample_rate, when, common_name, start_time, end_time):
 
     safe_name = _SAFE.sub("_", common_name).strip("_") or "bird"
     filename = f"{when:%Y%m%dT%H%M%S}_{safe_name}.wav"
-    sf.write(os.path.join(config.CLIPS_DIR, filename), slice_, sample_rate)
+    # 16-bit PCM (not the float32 default): half the size and playable in every
+    # browser, which matters now that clips are served to the web dashboard.
+    sf.write(os.path.join(config.CLIPS_DIR, filename), slice_, sample_rate,
+             subtype="PCM_16")
     return filename
 
 

@@ -210,6 +210,14 @@ def _local_clip(name):
     return path if os.path.isfile(path) else None
 
 
+def _clip_src(r):
+    """A playable audio source for a detection. Prefer the public S3 URL — it
+    works anywhere, including the cloud-hosted dashboard — and fall back to the
+    local file on the recording machine. None when neither is available (e.g. a
+    clip withheld for privacy, or one not yet uploaded)."""
+    return r.get("clip_url") or _local_clip(r.get("clip_path"))
+
+
 # --- Sidebar -------------------------------------------------------------
 
 st.sidebar.title("\U0001F426 The Ramble Register")
@@ -340,6 +348,9 @@ def _species_table(records, extra_config=None):
     df = pd.DataFrame(records)
     colcfg = {
         "Photo": st.column_config.ImageColumn("", width="small"),
+        # Inline, compact audio player in the row itself (vs a stack of
+        # full-width st.audio players) — keeps the table usable on a phone.
+        "Clip": st.column_config.AudioColumn("Clip", width="small"),
     }
     if extra_config:
         colcfg.update(extra_config)
@@ -369,26 +380,20 @@ with feed_tab:
                     "(`python -m capture.listen`) and play some birdsong near "
                     "the mic.")
             return
+        # Scientific name is dropped here to keep the row narrow on mobile
+        # (it's still in the Life list). Clip is an inline player in the row.
         records = [
             {
                 "Photo": species_photo(r["common_name"], r["scientific_name"])
                 if show_photos else None,
                 "Time": _fmt_time(r["detected_at"]),
                 "Species": r["common_name"],
-                "Scientific name": r["scientific_name"],
                 "Confidence": int(r["confidence"] * 100),
+                "Clip": _clip_src(r),
             }
             for r in rows
         ]
         _species_table(records, _conf_col())
-
-        clips = [(r, _local_clip(r["clip_path"])) for r in rows]
-        clips = [(r, p) for r, p in clips if p]
-        if clips:
-            st.caption("Recent clips (available on the recording machine)")
-            for r, path in clips[:10]:
-                st.write(f"{_fmt_time(r['detected_at'])} — **{r['common_name']}**")
-                st.audio(path)
 
     live_feed()
 

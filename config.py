@@ -60,6 +60,25 @@ def analysis_floor():
     be dropped before we ever see it."""
     return min([MIN_CONFIDENCE, *SPECIES_MIN_CONF.values()])
 
+# --- Privacy: human-voice filtering --------------------------------------
+
+# BirdNET's model includes non-bird "noise" classes, among them "Human vocal",
+# "Human non-vocal", and "Human whistle". When this is on, every segment is
+# analysed with those classes visible; if a human voice is heard above
+# HUMAN_VOICE_CONF, the segment's clips are kept on the recording machine only
+# and are never uploaded to the public S3 bucket. The bird detection itself is
+# still recorded — only the audio is withheld from the cloud.
+FILTER_HUMAN_VOICE = os.environ.get("BW_FILTER_HUMAN_VOICE", "1") != "0"
+HUMAN_VOICE_CONF = float(os.environ.get("BW_HUMAN_VOICE_CONF", "0.3"))
+
+# The model's non-bird label common-names. HUMAN_LABELS triggers the privacy
+# hold; the rest are simply never treated as bird detections.
+HUMAN_LABELS = {"Human vocal", "Human non-vocal", "Human whistle"}
+NON_BIRD_LABELS = HUMAN_LABELS | {
+    "Dog", "Engine", "Environmental", "Fireworks", "Gun", "Noise",
+    "Power tools", "Siren",
+}
+
 # Audio capture settings. BirdNET expects 48 kHz mono.
 SAMPLE_RATE = int(os.environ.get("BW_SAMPLE_RATE", "48000"))
 CHANNELS = 1
@@ -156,3 +175,14 @@ FEED_S3_REGION = os.environ.get("BW_FEED_S3_REGION", "")
 FEED_S3_ACL = os.environ.get("BW_FEED_S3_ACL", "")
 # Minimum seconds between feed publishes (the listener loops faster than this).
 FEED_INTERVAL = int(os.environ.get("BW_FEED_INTERVAL", "60"))
+
+# --- Audio clips in the dashboard ----------------------------------------
+
+# When the feed bucket is set, the listener also uploads each detection's audio
+# clip to S3 (under CLIPS_S3_PREFIX) so the cloud dashboard can play it — clips
+# otherwise live only on the recording machine. Reuses the feed's bucket,
+# region, ACL, and AWS credentials. Set BW_PUBLISH_CLIPS=0 to keep the JSON feed
+# but never upload audio. Clips flagged as containing a human voice are never
+# uploaded regardless (see FILTER_HUMAN_VOICE).
+PUBLISH_CLIPS = os.environ.get("BW_PUBLISH_CLIPS", "1") != "0"
+CLIPS_S3_PREFIX = os.environ.get("BW_CLIPS_S3_PREFIX", "birdwatcher/clips").strip("/")

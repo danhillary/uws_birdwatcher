@@ -130,8 +130,19 @@ asleep). The listener writes a heartbeat every segment to a small
 a dead one.
 
 The listener and dashboard share the same database, so the dashboard updates as
-new birds are detected. Audio-clip playback works on the machine that recorded
-the clips (the files stay local).
+new birds are detected. **Clip playback in the cloud** requires the clips to be
+reachable from the dashboard host: when the S3 feed bucket is configured (see
+below), the listener uploads each clip there and the dashboard plays it from a
+public URL. Without a bucket, playback still works on the recording machine
+itself, where the clip files live locally.
+
+### Privacy: human voices are kept out of the cloud
+
+BirdNET's model can recognise a human voice (its non-bird "Human vocal" classes).
+By default (`BW_FILTER_HUMAN_VOICE=1`), if a voice is heard in a segment, that
+segment's clips are **kept on the recording machine only** and never uploaded to
+the public bucket — the bird detection is still recorded, just without cloud
+audio. Tune `BW_HUMAN_VOICE_CONF` (default `0.3`) lower to be stricter.
 
 ## iPhone widget (optional)
 
@@ -160,8 +171,9 @@ prefix:
 }
 ```
 
-**2. Give the listener AWS credentials** with `s3:PutObject` on that prefix. Add
-to the listener's `.env`:
+**2. Give the listener AWS credentials** with `s3:PutObject` on that prefix
+(add `s3:DeleteObject` too if you also upload clips — the listener deletes a
+clip's S3 copy when it's pruned locally). Add to the listener's `.env`:
 
 ```
 BW_FEED_S3_BUCKET=YOUR-BUCKET
@@ -258,6 +270,10 @@ variables:
 | `BW_FEED_S3_REGION` | *(empty)*          | AWS region for the feed bucket                 |
 | `BW_FEED_S3_ACL`    | *(empty)*          | S3 ACL (e.g. `public-read`); omit if ACLs disabled |
 | `BW_FEED_INTERVAL`  | `60`               | Min seconds between feed publishes             |
+| `BW_PUBLISH_CLIPS`  | `1`                | Upload clips to S3 for cloud playback (`0` = off) |
+| `BW_CLIPS_S3_PREFIX`| `birdwatcher/clips`| S3 key prefix for uploaded clips               |
+| `BW_FILTER_HUMAN_VOICE` | `1`            | Keep clips with a human voice off the public bucket |
+| `BW_HUMAN_VOICE_CONF` | `0.3`            | Confidence at which a human voice triggers the hold |
 
 Example (PowerShell): `$env:BW_INPUT_DEVICE="UAC"; .venv\Scripts\python -m capture.listen`
 
@@ -296,6 +312,7 @@ analysis.py            # reusable BirdNET wrapper
 db.py                  # PostgreSQL storage + queries (SQLAlchemy)
 storage.py             # clip saving + storage-cap pruning
 feed.py                # publishes the iPhone-widget JSON feed to S3 (optional)
+clips_s3.py            # uploads detection clips to S3 for cloud playback (optional)
 streamlit_app.py       # Streamlit dashboard (also the Connect Cloud primary file)
 capture/
   list_devices.py      # list microphones

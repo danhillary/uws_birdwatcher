@@ -8,17 +8,20 @@ under the configured storage cap.
 Run with:  python -m capture.listen
 Stop with: Ctrl-C
 """
+import os
 import socket
 import sys
 
 import numpy as np
 import sounddevice as sd
 
+import clips_s3
 import config
 import db
 import feed
 import storage
-from analysis import BirdAnalyzer, dedupe_per_species, filter_by_confidence
+from analysis import (BirdAnalyzer, dedupe_per_species, filter_by_confidence,
+                      partition_detections)
 
 
 def resolve_device(spec):
@@ -103,6 +106,8 @@ def main():
         f"min confidence: {config.MIN_CONFIDENCE} "
         f"({len(config.SPECIES_MIN_CONF)} per-species overrides)\n"
         f"Saving to: {config.DB_HOST}/{config.DB_NAME} (schema {config.DB_SCHEMA})\n"
+        f"Clip uploads: {'on' if clips_s3.enabled() else 'off'} | "
+        f"human-voice filter: {'on' if config.FILTER_HUMAN_VOICE else 'off'}\n"
         f"Press Ctrl-C to stop.\n"
     )
 
@@ -131,13 +136,19 @@ def main():
                 continue
 
             when = config.now_local()
-            detections = dedupe_per_species(
-                filter_by_confidence(
-                    analyzer.analyze(audio, config.SAMPLE_RATE, when=when)
-                )
+            birds, has_voice = partition_detections(
+                analyzer.analyze(audio, config.SAMPLE_RATE, when=when)
             )
+            # partition_detections drops humans/non-birds and applies the
+            # location filter at the global floor; filter_by_confidence then
+            # enforces the stricter per-species bar (e.g. woodpecker vs jackhammer).
+            detections = dedupe_per_species(filter_by_confidence(birds))
 
             stamp = f"{when:%H:%M:%S}"
+            if has_voice:
+                # Privacy hold: a human voice is in this segment, so its clips
+                # stay on this machine and are never uploaded to the public S3.
+                print(f"[{stamp}]    (human voice heard — clips kept local only)")
             if not detections:
                 print(f"[{stamp}] ... no birds detected")
                 continue
@@ -147,9 +158,15 @@ def main():
                     audio, config.SAMPLE_RATE, when,
                     d["common_name"], d["start_time"], d["end_time"],
                 )
+                clip_url = None
+                if not has_voice:
+                    clip_url = clips_s3.upload(
+                        clip, os.path.join(config.CLIPS_DIR, clip)
+                    )
                 db.insert_detection(
                     when, d["common_name"], d["scientific_name"],
-                    d["confidence"], config.LATITUDE, config.LONGITUDE, clip,
+                    d["confidence"], config.LATITUDE, config.LONGITUDE,
+                    clip, clip_url,
                 )
                 print(
                     f"[{stamp}] \U0001F426 {d['common_name']} "
@@ -157,9 +174,11 @@ def main():
                 )
                 last_det = when
 
-            # Keep clip storage under the cap; forget pruned clips in the DB.
+            # Keep clip storage under the cap; forget pruned clips in the DB and
+            # delete their S3 copies so local and cloud retention stay in step.
             removed = storage.prune_to_cap()
             if removed:
+                clips_s3.delete_many(removed)
                 db.clear_clip_paths(removed)
                 print(f"   (pruned {len(removed)} old clip(s) to stay under "
                       f"{config.MAX_CLIPS_MB} MB)")
