@@ -36,10 +36,17 @@ const DOT = {
 
 // Make tapping the widget open the dashboard (no-op if DASHBOARD_URL is blank,
 // so clearing it leaves the widget purely glanceable).
+//
+// iOS hands an https:// tap to whatever the *default* browser is (Chrome, etc.).
+// To always land in Safari — where the dashboard's saved-to-Home-Screen layout
+// lives and renders best — we swap the scheme to x-safari-https://, which forces
+// Safari regardless of the default browser. (Custom schemes like shortcuts:// are
+// passed through untouched so you can still point DASHBOARD_URL at a Shortcut.)
 function linkToDashboard(w) {
-  if (DASHBOARD_URL) {
-    w.url = DASHBOARD_URL;
-  }
+  if (!DASHBOARD_URL) return;
+  w.url = DASHBOARD_URL.startsWith("https://")
+    ? "x-safari-" + DASHBOARD_URL
+    : DASHBOARD_URL;
 }
 
 async function loadFeed() {
