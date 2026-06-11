@@ -9,9 +9,11 @@
 //      Name it "Ramble Register".
 //   3. Set FEED_URL below to your public latest.json URL (the S3 object the
 //      listener publishes — see the project README, "iPhone widget").
-//   4. Run it once inside Scriptable to check it renders (and to let it ask for
+//   4. Set DASHBOARD_URL to your dashboard's address so tapping the widget
+//      opens it (the Posit Connect Cloud URL of the Streamlit app).
+//   5. Run it once inside Scriptable to check it renders (and to let it ask for
 //      network permission).
-//   5. Long-press the home screen → ＋ → Scriptable → pick a size (Medium looks
+//   6. Long-press the home screen → ＋ → Scriptable → pick a size (Medium looks
 //      best) → add it. Long-press the placed widget → Edit Widget → Script:
 //      "Ramble Register".
 //
@@ -21,12 +23,24 @@
 
 const FEED_URL = "https://YOUR-BUCKET.s3.amazonaws.com/birdwatcher/latest.json";
 
+// Tapping the widget opens this URL (your dashboard). Leave it as-is to disable
+// tap-to-open. Use the full https:// address of the deployed Streamlit app.
+const DASHBOARD_URL = "https://YOUR-DASHBOARD-URL";
+
 const DOT = {
   green: "#4ccb76",
   yellow: "#e8b04b",
   red: "#e0584f",
   unknown: "#9bb0a8",
 };
+
+// Make tapping the widget open the dashboard (no-op if DASHBOARD_URL is still
+// the placeholder, so the widget just stays glanceable until you set it).
+function linkToDashboard(w) {
+  if (DASHBOARD_URL && DASHBOARD_URL !== "https://YOUR-DASHBOARD-URL") {
+    w.url = DASHBOARD_URL;
+  }
+}
 
 async function loadFeed() {
   const req = new Request(FEED_URL);
@@ -53,6 +67,7 @@ function buildErrorWidget(message) {
   const m = w.addText(message);
   m.font = Font.systemFont(11);
   m.textColor = new Color("#bcd6cb");
+  linkToDashboard(w);
   return w;
 }
 
@@ -128,6 +143,9 @@ async function buildWidget() {
   );
   footer.font = Font.mediumSystemFont(11);
   footer.textColor = new Color("#a8c7bb");
+
+  // Tapping the widget opens the dashboard.
+  linkToDashboard(w);
 
   // Ask iOS to refresh in ~10 minutes (best-effort; the OS has final say).
   w.refreshAfterDate = new Date(Date.now() + 10 * 60 * 1000);
