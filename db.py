@@ -10,7 +10,7 @@ runs.
 """
 import datetime
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import bindparam, create_engine, text
 
 import config
 
@@ -32,6 +32,7 @@ def _ident(name):
 _SCHEMA = _ident(config.DB_SCHEMA)
 _TABLE = f'"{_SCHEMA}".detections'
 _STATUS = f'"{_SCHEMA}".listener_status'
+_VOTES = f'"{_SCHEMA}".clip_votes'
 
 
 def get_engine():
@@ -74,6 +75,13 @@ def init_db():
         updated_at        TIMESTAMP NOT NULL,
         last_peak         DOUBLE PRECISION,
         last_detection_at TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS {_VOTES} (
+        detection_id BIGINT    NOT NULL,
+        voter        TEXT      NOT NULL,
+        vote         SMALLINT  NOT NULL,
+        created_at   TIMESTAMP NOT NULL,
+        PRIMARY KEY (detection_id, voter)
     );
     """
     with get_engine().begin() as conn:
@@ -269,3 +277,59 @@ def detections_per_day(conn, days=14):
         ORDER BY day
     """), {"start": start}).mappings().all()
     return [dict(r) for r in rows]
+
+
+# --- Clip voting --------------------------------------------------------
+# Listeners up/down-vote whether a clip matches its species label. One row per
+# (detection, voter); re-voting overwrites. vote is +1 (up), -1 (down), or 0
+# (vote withdrawn — kept so a withdrawal still overwrites the prior row).
+
+def record_vote(detection_id, voter, vote):
+    """Upsert one voter's verdict on a detection's clip. Opens its own txn.
+
+    ``vote`` is +1, -1, or 0 (withdrawn). Writing requires INSERT/UPDATE on the
+    schema, so on a read-only dashboard DB user this raises — the caller treats
+    that as 'voting unavailable'."""
+    with get_engine().begin() as conn:
+        conn.execute(
+            text(f"""INSERT INTO {_VOTES} (detection_id, voter, vote, created_at)
+                     VALUES (:id, :voter, :vote, :ts)
+                     ON CONFLICT (detection_id, voter) DO UPDATE SET
+                         vote = EXCLUDED.vote, created_at = EXCLUDED.created_at"""),
+            {"id": int(detection_id), "voter": voter, "vote": int(vote),
+             "ts": config.now_local().replace(microsecond=0)},
+        )
+
+
+def vote_tallies(conn, detection_ids):
+    """Map detection_id -> {'up', 'down', 'net'} for the given ids (only ids with
+    at least one vote appear). Returns {} for an empty id list."""
+    ids = [int(i) for i in detection_ids if i is not None]
+    if not ids:
+        return {}
+    stmt = text(f"""
+        SELECT detection_id,
+               SUM(CASE WHEN vote > 0 THEN 1 ELSE 0 END) AS up,
+               SUM(CASE WHEN vote < 0 THEN 1 ELSE 0 END) AS down
+        FROM {_VOTES}
+        WHERE detection_id IN :ids
+        GROUP BY detection_id
+    """).bindparams(bindparam("ids", expanding=True))
+    out = {}
+    for r in conn.execute(stmt, {"ids": ids}).mappings().all():
+        up, down = int(r["up"] or 0), int(r["down"] or 0)
+        out[r["detection_id"]] = {"up": up, "down": down, "net": up - down}
+    return out
+
+
+def my_votes(conn, voter, detection_ids):
+    """This voter's existing votes: detection_id -> vote (+1/-1/0). Lets the
+    dashboard show which button a returning voter already picked."""
+    ids = [int(i) for i in detection_ids if i is not None]
+    if not ids or not voter:
+        return {}
+    stmt = text(f"""SELECT detection_id, vote FROM {_VOTES}
+                    WHERE voter = :voter AND detection_id IN :ids"""
+                ).bindparams(bindparam("ids", expanding=True))
+    return {r["detection_id"]: int(r["vote"])
+            for r in conn.execute(stmt, {"voter": voter, "ids": ids}).mappings().all()}

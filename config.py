@@ -146,3 +146,13 @@ FEED_INTERVAL = int(os.environ.get("BW_FEED_INTERVAL", "60"))
 # uploaded regardless (see FILTER_HUMAN_VOICE).
 PUBLISH_CLIPS = os.environ.get("BW_PUBLISH_CLIPS", "1") != "0"
 CLIPS_S3_PREFIX = os.environ.get("BW_CLIPS_S3_PREFIX", "birdwatcher/clips").strip("/")
+
+# --- Clip voting (dashboard) ---------------------------------------------
+
+# Listeners can up/down-vote whether a clip actually matches its species label.
+# A detection whose net score (upvotes - downvotes) falls to or below this
+# threshold is flagged "Disputed" in the live feed (it is still shown, never
+# auto-deleted). Lower = more tolerant; raise toward 0 to flag sooner.
+# NOTE: voting WRITES to the database, so the dashboard's DB user needs
+# INSERT/UPDATE on the birdwatcher schema (read-only credentials disable voting).
+DISPUTED_THRESHOLD = int(os.environ.get("BW_DISPUTED_THRESHOLD", "-3"))
