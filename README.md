@@ -208,11 +208,12 @@ That prints the JSON and uploads it. Confirm the public URL loads in a browser:
 running listener refreshes it about once a minute (`BW_FEED_INTERVAL`).
 
 **3. Add the widget.** Install **[Scriptable](https://scriptable.app)** (free) on
-the iPhone, create a new script, and paste in `widget/RambleRegister.js`. Set
-`FEED_URL` at the top to your public URL and `DASHBOARD_URL` to your dashboard's
-address (so tapping the widget opens it), run it once to grant network access,
-then long-press the home screen → ＋ → Scriptable → add a **Medium** widget and
-point it at the script. (Full setup notes are in the file's header.)
+the iPhone, create a new script, and paste in `widget/RambleRegister.js`.
+`FEED_URL` and `DASHBOARD_URL` at the top are pre-filled with this project's
+public feed and dashboard (tapping the widget opens the dashboard) — change them
+only if you run your own instance. Run it once to grant network access, then
+long-press the home screen → ＋ → Scriptable → add a **Medium** widget and point
+it at the script. (Full setup notes are in the file's header.)
 
 ## Database
 
