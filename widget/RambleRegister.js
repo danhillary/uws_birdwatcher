@@ -7,13 +7,12 @@
 //   1. Install "Scriptable" from the App Store (free).
 //   2. Open Scriptable → ＋ (new script) → paste this whole file in.
 //      Name it "Ramble Register".
-//   3. Set FEED_URL below to your public latest.json URL (the S3 object the
-//      listener publishes — see the project README, "iPhone widget").
-//   4. Set DASHBOARD_URL to your dashboard's address so tapping the widget
-//      opens it (the Posit Connect Cloud URL of the Streamlit app).
-//   5. Run it once inside Scriptable to check it renders (and to let it ask for
+//   3. FEED_URL and DASHBOARD_URL below are pre-filled with this project's
+//      public feed and dashboard — leave them as-is to track the live Ramble
+//      Register, or point them at your own if you run a separate instance.
+//   4. Run it once inside Scriptable to check it renders (and to let it ask for
 //      network permission).
-//   6. Long-press the home screen → ＋ → Scriptable → pick a size (Medium looks
+//   5. Long-press the home screen → ＋ → Scriptable → pick a size (Medium looks
 //      best) → add it. Long-press the placed widget → Edit Widget → Script:
 //      "Ramble Register".
 //
@@ -21,11 +20,12 @@
 // feed itself updates about once a minute.
 // =============================================================================
 
-const FEED_URL = "https://YOUR-BUCKET.s3.amazonaws.com/birdwatcher/latest.json";
+// Public feed published by the listener (override if you run your own instance).
+const FEED_URL = "https://uws-birdwatcher.s3.amazonaws.com/birdwatcher/latest.json";
 
-// Tapping the widget opens this URL (your dashboard). Leave it as-is to disable
-// tap-to-open. Use the full https:// address of the deployed Streamlit app.
-const DASHBOARD_URL = "https://YOUR-DASHBOARD-URL";
+// Tapping the widget opens this URL (the dashboard). Set it to "" to disable
+// tap-to-open, or point it at your own deployed Streamlit app.
+const DASHBOARD_URL = "https://danhillary-ramble-register.share.connect.posit.cloud/";
 
 const DOT = {
   green: "#4ccb76",
@@ -34,12 +34,19 @@ const DOT = {
   unknown: "#9bb0a8",
 };
 
-// Make tapping the widget open the dashboard (no-op if DASHBOARD_URL is still
-// the placeholder, so the widget just stays glanceable until you set it).
+// Make tapping the widget open the dashboard (no-op if DASHBOARD_URL is blank,
+// so clearing it leaves the widget purely glanceable).
+//
+// iOS hands an https:// tap to whatever the *default* browser is (Chrome, etc.).
+// To always land in Safari — where the dashboard's saved-to-Home-Screen layout
+// lives and renders best — we swap the scheme to x-safari-https://, which forces
+// Safari regardless of the default browser. (Custom schemes like shortcuts:// are
+// passed through untouched so you can still point DASHBOARD_URL at a Shortcut.)
 function linkToDashboard(w) {
-  if (DASHBOARD_URL && DASHBOARD_URL !== "https://YOUR-DASHBOARD-URL") {
-    w.url = DASHBOARD_URL;
-  }
+  if (!DASHBOARD_URL) return;
+  w.url = DASHBOARD_URL.startsWith("https://")
+    ? "x-safari-" + DASHBOARD_URL
+    : DASHBOARD_URL;
 }
 
 async function loadFeed() {
