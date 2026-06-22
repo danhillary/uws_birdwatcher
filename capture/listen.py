@@ -8,7 +8,6 @@ under the configured storage cap.
 Run with:  python -m capture.listen
 Stop with: Ctrl-C
 """
-import os
 import socket
 import sys
 
@@ -149,14 +148,27 @@ def main():
                 continue
 
             for d in detections:
-                clip = storage.save_clip(
-                    audio, config.SAMPLE_RATE, when,
-                    d["common_name"], d["start_time"], d["end_time"],
-                )
-                clip_url = None
-                if not has_voice:
-                    clip_url = clips_s3.upload(
-                        clip, os.path.join(config.CLIPS_DIR, clip)
+                if has_voice:
+                    # Privacy hold: keep this clip on the recording machine only,
+                    # never on the public bucket.
+                    clip = storage.save_clip(
+                        audio, config.SAMPLE_RATE, when,
+                        d["common_name"], d["start_time"], d["end_time"],
+                    )
+                    clip_url = None
+                else:
+                    # Bird clips live in S3 only — encode in memory and upload,
+                    # writing local disk only if the upload fails, so the clip
+                    # isn't lost and the backfill tool can retry it later.
+                    filename = storage.clip_filename(when, d["common_name"])
+                    data = storage.encode_clip(
+                        audio, config.SAMPLE_RATE,
+                        d["start_time"], d["end_time"],
+                    )
+                    clip_url = clips_s3.upload_bytes(filename, data)
+                    clip = None if clip_url else storage.save_clip(
+                        audio, config.SAMPLE_RATE, when,
+                        d["common_name"], d["start_time"], d["end_time"],
                     )
                 db.insert_detection(
                     when, d["common_name"], d["scientific_name"],
@@ -165,17 +177,18 @@ def main():
                 )
                 print(
                     f"[{stamp}] \U0001F426 {d['common_name']} "
-                    f"({d['scientific_name']}) — {d['confidence']:.0%}  -> {clip}"
+                    f"({d['scientific_name']}) — {d['confidence']:.0%}  "
+                    f"-> {clip_url or clip or 'S3'}"
                 )
                 last_det = when
 
-            # Keep clip storage under the cap; forget pruned clips in the DB and
-            # delete their S3 copies so local and cloud retention stay in step.
+            # Keep the *local* clip cache (human-voice holds + any upload
+            # fallbacks) under the cap, and forget pruned files in the DB. S3
+            # copies are permanent and never pruned.
             removed = storage.prune_to_cap()
             if removed:
-                clips_s3.delete_many(removed)
                 db.clear_clip_paths(removed)
-                print(f"   (pruned {len(removed)} old clip(s) to stay under "
+                print(f"   (pruned {len(removed)} local clip(s) to stay under "
                       f"{config.MAX_CLIPS_MB} MB)")
     except KeyboardInterrupt:
         print("\nStopped.")

@@ -162,14 +162,14 @@ def set_clip_url(detection_id, url):
 
 
 def clear_clip_paths(filenames):
-    """Null out clip_path *and* clip_url for clips pruned from disk. The S3 copy
-    is deleted in lock-step (see clips_s3.delete_many), so neither the local nor
-    the cloud player should point at audio that no longer exists."""
+    """Null out clip_path for local clips pruned from disk, so the dashboard's
+    local fallback never points at a missing file. clip_url is left untouched —
+    the S3 copy is permanent (bird clips are never deleted from the bucket)."""
     if not filenames:
         return
     with get_engine().begin() as conn:
         conn.execute(
-            text(f"UPDATE {_TABLE} SET clip_path = NULL, clip_url = NULL "
+            text(f"UPDATE {_TABLE} SET clip_path = NULL "
                  f"WHERE clip_path = :f"),
             [{"f": f} for f in filenames],
         )

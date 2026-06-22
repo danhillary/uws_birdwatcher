@@ -132,9 +132,10 @@ a dead one.
 The listener and dashboard share the same database, so the dashboard updates as
 new birds are detected. **Clip playback in the cloud** requires the clips to be
 reachable from the dashboard host: when the S3 feed bucket is configured (see
-below), the listener uploads each clip there and the dashboard plays it from a
-public URL. Without a bucket, playback still works on the recording machine
-itself, where the clip files live locally.
+below), the listener uploads each bird clip there — straight from memory, so it
+lives in S3 only and never on local disk — and the dashboard plays it from a
+public URL. Without a bucket (or with `BW_PUBLISH_CLIPS=0`), clips fall back to
+local files on the recording machine, where playback still works.
 
 ### Privacy: human voices are kept out of the cloud
 
@@ -185,9 +186,9 @@ prefix:
 }
 ```
 
-**2. Give the listener AWS credentials** with `s3:PutObject` on that prefix
-(add `s3:DeleteObject` too if you also upload clips — the listener deletes a
-clip's S3 copy when it's pruned locally). Add to the listener's `.env`:
+**2. Give the listener AWS credentials** with `s3:PutObject` on that prefix.
+(Clips are never deleted from the bucket, so no `s3:DeleteObject` is needed.)
+Add to the listener's `.env`:
 
 ```
 BW_FEED_S3_BUCKET=YOUR-BUCKET
@@ -231,8 +232,9 @@ cp .env.example .env   # then edit .env with your DB host/name/user/password
 ```
 
 `.env` is gitignored — credentials are never committed. The first run creates
-the schema, table, and indexes automatically. Audio-clip files stay on the
-machine that recorded them (clip playback is a local-only feature for now).
+the schema, table, and indexes automatically. With an S3 bucket configured, bird
+clips are stored in the cloud (and play in the hosted dashboard); without one,
+clips stay on the machine that recorded them.
 
 ## Host the dashboard online (Posit Connect Cloud)
 
@@ -254,8 +256,9 @@ which builds straight from this GitHub repo:
 writes to the shared PostgreSQL database; the cloud-hosted dashboard reads from
 that same database, so detections recorded at home appear online. A freshly
 deployed dashboard renders but stays empty until the listener records something.
-Audio-clip playback remains a local-only feature unless clips are also uploaded
-to cloud storage. See the roadmap.
+Bird-clip playback works in the cloud once an S3 bucket is configured (clips are
+uploaded there and never written to local disk); otherwise playback is
+local-only. See the iPhone-widget section for the bucket setup.
 
 ## Configuration
 
@@ -278,8 +281,8 @@ variables:
 | `BW_DATABASE_URL`   | *(empty)*          | Full SQLAlchemy URL (overrides the `DB_*` set) |
 | `BW_DB_SCHEMA`      | `birdwatcher`      | Schema holding the detections table            |
 | `BW_TIMEZONE`       | `America/New_York` | Local TZ for "today"/hourly buckets            |
-| `BW_CLIPS_DIR`      | `clips/`           | Folder for saved audio clips                   |
-| `BW_MAX_CLIPS_MB`   | `2000`             | Clip storage cap; oldest clips pruned over it  |
+| `BW_CLIPS_DIR`      | `clips/`           | Local cache for clips not on S3 (voice holds, upload fallbacks) |
+| `BW_MAX_CLIPS_MB`   | `2000`             | Local clip-cache cap; oldest local clips pruned over it (S3 never pruned) |
 | `BW_FEED_S3_BUCKET` | *(empty)*          | S3 bucket for the iPhone-widget feed; empty = off |
 | `BW_FEED_S3_KEY`    | `birdwatcher/latest.json` | S3 key for the published JSON feed      |
 | `BW_FEED_S3_REGION` | *(empty)*          | AWS region for the feed bucket                 |
@@ -330,5 +333,8 @@ requirements-listen.txt# adds the BirdNET + microphone stack (home machine only)
   Connect Cloud with the `DB_*`/`BW_DB_SCHEMA` env vars set ✅; the Windows
   listener runs in the background and writes to the shared database, so home
   detections appear online — the **data bridge** is live end-to-end ✅.
-- **Phase 6 (maybe later)** — optional cloud audio storage (e.g. S3) so clip
-  playback works from the hosted dashboard, not just the recording machine.
+- **Phase 6 (done)** — cloud audio storage on S3 so clip playback works from the
+  hosted dashboard, not just the recording machine ✅. Bird clips are uploaded
+  straight from memory and live in **S3 only** (never written to local disk) and
+  are never pruned from the bucket; only human-voice holds and failed-upload
+  fallbacks are kept locally ✅.

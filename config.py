@@ -59,14 +59,17 @@ INPUT_DEVICE = os.environ.get("BW_INPUT_DEVICE") or "UAC"
 # SQLite database file holding every detection.
 DB_PATH = os.environ.get("BW_DB_PATH") or os.path.join(BASE_DIR, "birdwatcher.db")
 
-# Directory holding saved audio clips, one short WAV per detection.
+# Local cache for clips that can't go to the public bucket: human-voice holds
+# and any clip whose S3 upload failed. Bird clips live in S3 only and never land
+# here (see clips_s3 / capture.listen).
 CLIPS_DIR = os.environ.get("BW_CLIPS_DIR") or os.path.join(BASE_DIR, "clips")
 
 # Seconds of padding kept on each side of a detection when saving its clip.
 CLIP_PADDING_SECONDS = float(os.environ.get("BW_CLIP_PADDING", "1.0"))
 
-# Storage cap for the clips directory, in megabytes. When exceeded, the oldest
-# clips are deleted (detection rows are always kept). 0 disables pruning.
+# Storage cap for the local clips cache, in megabytes. When exceeded, the oldest
+# *local* clips are deleted (detection rows are always kept; S3 copies are never
+# pruned). 0 disables pruning.
 MAX_CLIPS_MB = int(os.environ.get("BW_MAX_CLIPS_MB", "2000"))
 
 # --- Timezone (Phase 5) --------------------------------------------------
@@ -138,12 +141,14 @@ FEED_INTERVAL = int(os.environ.get("BW_FEED_INTERVAL", "60"))
 
 # --- Audio clips in the dashboard ----------------------------------------
 
-# When the feed bucket is set, the listener also uploads each detection's audio
-# clip to S3 (under CLIPS_S3_PREFIX) so the cloud dashboard can play it — clips
-# otherwise live only on the recording machine. Reuses the feed's bucket,
-# region, ACL, and AWS credentials. Set BW_PUBLISH_CLIPS=0 to keep the JSON feed
-# but never upload audio. Clips flagged as containing a human voice are never
-# uploaded regardless (see FILTER_HUMAN_VOICE).
+# When the feed bucket is set, the listener uploads each detection's audio clip
+# to S3 (under CLIPS_S3_PREFIX) so the cloud dashboard can play it. Bird clips
+# live in S3 only — they are uploaded from memory and never written to local
+# disk, and never deleted from the bucket. Reuses the feed's bucket, region,
+# ACL, and AWS credentials. Set BW_PUBLISH_CLIPS=0 to keep the JSON feed but
+# never upload audio (clips then fall back to local disk, like a human-voice
+# hold). Clips flagged as containing a human voice are never uploaded regardless
+# (see FILTER_HUMAN_VOICE) — they stay on the recording machine.
 PUBLISH_CLIPS = os.environ.get("BW_PUBLISH_CLIPS", "1") != "0"
 CLIPS_S3_PREFIX = os.environ.get("BW_CLIPS_S3_PREFIX", "birdwatcher/clips").strip("/")
 
