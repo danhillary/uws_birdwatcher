@@ -316,5 +316,8 @@ requirements-listen.txt# adds the BirdNET + microphone stack (home machine only)
   Connect Cloud with the `DB_*`/`BW_DB_SCHEMA` env vars set ✅; the Windows
   listener runs in the background and writes to the shared database, so home
   detections appear online — the **data bridge** is live end-to-end ✅.
-- **Phase 6 (maybe later)** — optional cloud audio storage (e.g. S3) so clip
-  playback works from the hosted dashboard, not just the recording machine.
+- **Phase 6 (done)** — cloud audio storage on S3 so clip playback works from the
+  hosted dashboard, not just the recording machine ✅. Bird clips are uploaded
+  straight from memory and live in **S3 only** (never written to local disk) and
+  are never pruned from the bucket; only human-voice holds and failed-upload
+  fallbacks are kept locally ✅.
