@@ -12,4 +12,5 @@ Set sh = CreateObject("WScript.Shell")
 sh.CurrentDirectory = scriptDir
 
 ' 0 = hidden window, False = don't wait for it to finish.
-sh.Run "cmd /c "".venv\Scripts\python.exe"" -m capture.listen >> listener.log 2>&1", 0, False
+' -u = unbuffered stdout/stderr, so listener.log updates live instead of in blocks.
+sh.Run "cmd /c "".venv\Scripts\python.exe"" -u -m capture.listen >> listener.log 2>&1", 0, False
