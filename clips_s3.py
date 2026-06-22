@@ -1,14 +1,15 @@
 """Upload detection audio clips to S3 so the cloud dashboard can play them.
 
-Clips are written to ``config.CLIPS_DIR`` on the recording machine; a host that
-only runs the dashboard (Posit Connect Cloud) has no access to those files. So
-the listener mirrors each clip to the same public S3 bucket the iPhone feed
-uses, and stores the public URL on the detection row. The dashboard then plays
-straight from the URL.
+A host that only runs the dashboard (Posit Connect Cloud) has no access to the
+recording machine's disk. So the listener uploads each bird clip to the same
+public S3 bucket the iPhone feed uses and stores the public URL on the detection
+row; the dashboard plays straight from the URL. Bird clips live in S3 *only* —
+the listener uploads them from memory (``upload_bytes``) without ever writing
+local disk — and they are never deleted from the bucket.
 
 The whole feature is a no-op unless ``BW_FEED_S3_BUCKET`` is set and
 ``BW_PUBLISH_CLIPS`` is on. Clips containing a human voice are never uploaded —
-the listener simply doesn't call ``upload()`` for them (see capture.listen).
+the listener keeps those on the recording machine instead (see capture.listen).
 """
 import os
 
@@ -42,8 +43,8 @@ def _client():
     return boto3.client("s3", **kwargs)
 
 
-def upload(filename, local_path):
-    """Upload one clip and return its public URL, or None on failure/disabled.
+def _put(filename, body):
+    """Put one clip body to S3 under its key and return the public URL, or None.
 
     Best-effort: any error is swallowed (and logged) so an S3 hiccup never
     disturbs the capture loop — the detection is still recorded, just without a
@@ -52,8 +53,6 @@ def upload(filename, local_path):
         return None
     key = _key(filename)
     try:
-        with open(local_path, "rb") as f:
-            body = f.read()
         put_kwargs = {
             "Bucket": config.FEED_S3_BUCKET,
             "Key": key,
@@ -71,16 +70,21 @@ def upload(filename, local_path):
     return _public_url(key)
 
 
-def delete_many(filenames):
-    """Best-effort delete of clips pruned from local disk, so the bucket tracks
-    the same retention as CLIPS_DIR and the dashboard never shows a dead player.
-    Swallows all errors."""
-    if not enabled() or not filenames:
-        return
+def upload_bytes(filename, data):
+    """Upload an in-memory clip and return its public URL, or None. Lets the
+    listener store bird clips in S3 only, never touching local disk."""
+    return _put(filename, data)
+
+
+def upload(filename, local_path):
+    """Upload a clip from a local file and return its public URL, or None. Used
+    by the backfill tool, which re-uploads clips already sitting on disk."""
+    if not enabled():
+        return None
     try:
-        objects = [{"Key": _key(f)} for f in filenames]
-        _client().delete_objects(
-            Bucket=config.FEED_S3_BUCKET, Delete={"Objects": objects}
-        )
-    except Exception as e:
-        print(f"   (clip S3 prune failed: {e})")
+        with open(local_path, "rb") as f:
+            body = f.read()
+    except OSError as e:
+        print(f"   (clip read failed: {e})")
+        return None
+    return _put(filename, body)
