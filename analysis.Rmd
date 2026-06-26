@@ -1,0 +1,318 @@
+---
+title: "The Ramble Register — exploratory analysis"
+subtitle: "Acoustic bird detections from the Upper West Side"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 9, fig.height = 5, dpi = 110
+)
+```
+
+This notebook connects to the same PostgreSQL database the listener writes to and
+the dashboard reads from, pulls every detection into a data frame, and explores
+it. It reuses the project's `.env` for credentials, so **nothing secret lives in
+this file** — it is safe to commit.
+
+> Read-only by design: every query here is a `SELECT`. Point it at a read-only
+> DB role if you have one.
+
+## 1. Install the R packages (run once)
+
+This chunk does not run automatically. Run it by hand the first time, then leave
+it be.
+
+```{r install, eval=FALSE}
+install.packages(c(
+  "DBI", "RPostgres",   # database connection
+  "dplyr", "tidyr",     # wrangling
+  "lubridate",          # timestamps
+  "ggplot2", "scales",  # plots
+  "knitr"               # tables
+))
+```
+
+```{r libraries}
+library(DBI)
+library(RPostgres)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(scales)
+library(knitr)
+```
+
+## 2. Credentials & connection
+
+The project keeps its Postgres credentials in a `.env` file next to this
+notebook (the same one `config.py` loads). We read it here so they never have to
+be typed into — or saved in — this document. `.env` is git-ignored.
+
+If you ran the listener/dashboard locally, `.env` already exists. Otherwise copy
+`.env.example` to `.env` and fill in `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASS`
+(and `DB_PORT` / `BW_DB_SCHEMA` if non-default).
+
+```{r read-env}
+# Load .env (KEY=VALUE lines) into the R session environment, just like
+# python-dotenv does for the rest of the project.
+if (file.exists(".env")) {
+  readRenviron(".env")
+} else {
+  warning("No .env found — relying on variables already set in the environment.")
+}
+
+# Pull the same variables config.py uses, with the same defaults.
+db_host   <- Sys.getenv("DB_HOST",      "localhost")
+db_port   <- Sys.getenv("DB_PORT",      "5432")
+db_name   <- Sys.getenv("DB_NAME",      "birdwatcher")
+db_user   <- Sys.getenv("DB_USER",      "")
+db_pass   <- Sys.getenv("DB_PASS",      "")
+db_schema <- Sys.getenv("BW_DB_SCHEMA", "birdwatcher")
+tz        <- Sys.getenv("BW_TIMEZONE",  "America/New_York")
+
+# If a full SQLAlchemy-style URL was supplied instead of the parts, unpack it.
+# Form: postgresql+psycopg2://user:pass@host:port/dbname
+db_url <- Sys.getenv("BW_DATABASE_URL", "")
+if (nzchar(db_url)) {
+  m <- regmatches(
+    db_url,
+    regexec("://([^:@/]+)(?::([^@/]*))?@([^:/]+)(?::(\\d+))?/(.+)$", db_url)
+  )[[1]]
+  if (length(m) == 6) {
+    db_user <- m[2]; db_pass <- m[3]; db_host <- m[4]
+    db_port <- ifelse(nzchar(m[5]), m[5], db_port); db_name <- m[6]
+  }
+}
+
+stopifnot(nzchar(db_user))  # fail early with a clear message if .env is empty
+```
+
+```{r connect}
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host     = db_host,
+  port     = as.integer(db_port),
+  dbname   = db_name,
+  user     = db_user,
+  password = db_pass
+)
+
+# Scope unqualified table names to the birdwatcher schema (validated to a safe
+# identifier first, mirroring db.py's _ident check).
+stopifnot(grepl("^[A-Za-z0-9_]+$", db_schema))
+dbExecute(con, sprintf('SET search_path TO "%s"', db_schema))
+```
+
+## 3. Pull the data
+
+Detections are stored as timezone-naive **local** wall-clock time (see
+`config.now_local`). We cast to text in SQL and re-parse with the project's
+timezone so hour-of-day buckets are exactly right regardless of the R session's
+locale.
+
+```{r load-detections}
+det <- dbGetQuery(con, "
+  SELECT id,
+         detected_at::text AS detected_at,
+         common_name,
+         scientific_name,
+         confidence,
+         clip_path,
+         clip_url
+  FROM detections
+  ORDER BY detected_at
+")
+
+det <- det %>%
+  mutate(
+    detected_at = ymd_hms(detected_at, tz = tz),
+    date        = as_date(detected_at),
+    hour        = hour(detected_at),
+    weekday     = wday(detected_at, label = TRUE, week_start = 1),
+    has_clip    = !is.na(clip_url)
+  )
+
+nrow(det)
+```
+
+```{r load-votes}
+# Clip up/down votes (may be empty if no one has voted yet).
+votes <- dbGetQuery(con, "
+  SELECT detection_id, voter, vote, created_at::text AS created_at
+  FROM clip_votes
+")
+nrow(votes)
+```
+
+## 4. Overview
+
+```{r overview}
+overview <- tibble(
+  metric = c("Total detections", "Distinct species", "Days with activity",
+             "First detection", "Latest detection", "Clips with audio"),
+  value  = c(
+    format(nrow(det), big.mark = ","),
+    as.character(n_distinct(det$common_name)),
+    as.character(n_distinct(det$date)),
+    as.character(min(det$detected_at)),
+    as.character(max(det$detected_at)),
+    sprintf("%d (%.0f%%)", sum(det$has_clip), 100 * mean(det$has_clip))
+  )
+)
+kable(overview, col.names = c("", ""))
+```
+
+## 5. Most-heard species
+
+```{r top-species}
+top_species <- det %>%
+  count(common_name, name = "detections") %>%
+  arrange(desc(detections)) %>%
+  slice_head(n = 20)
+
+ggplot(top_species, aes(reorder(common_name, detections), detections)) +
+  geom_col(fill = "#2e7d5b") +
+  coord_flip() +
+  labs(title = "Top 20 species by number of detections",
+       x = NULL, y = "Detections") +
+  theme_minimal(base_size = 12)
+```
+
+## 6. Activity over time
+
+```{r daily-trend}
+daily <- det %>% count(date, name = "detections")
+
+ggplot(daily, aes(date, detections)) +
+  geom_col(fill = "#2e7d5b") +
+  scale_x_date(labels = label_date_short()) +
+  labs(title = "Detections per day", x = NULL, y = "Detections") +
+  theme_minimal(base_size = 12)
+```
+
+```{r cumulative-species}
+# When was each species first heard? A cumulative "life list" curve.
+first_seen <- det %>%
+  group_by(common_name) %>%
+  summarise(first = min(date), .groups = "drop") %>%
+  arrange(first) %>%
+  mutate(cumulative_species = row_number())
+
+ggplot(first_seen, aes(first, cumulative_species)) +
+  geom_step(color = "#2e7d5b", linewidth = 0.8) +
+  labs(title = "Cumulative species heard (life list growth)",
+       x = NULL, y = "Distinct species") +
+  theme_minimal(base_size = 12)
+```
+
+## 7. Daily rhythm (when are birds active?)
+
+```{r diurnal}
+hourly <- det %>% count(hour, name = "detections")
+
+ggplot(hourly, aes(hour, detections)) +
+  geom_col(fill = "#2e7d5b") +
+  scale_x_continuous(breaks = seq(0, 23, 3)) +
+  labs(title = "Detections by hour of day (all dates pooled)",
+       x = "Hour", y = "Detections") +
+  theme_minimal(base_size = 12)
+```
+
+```{r hour-weekday-heatmap}
+# Hour-of-day × day-of-week heatmap — surfaces dawn-chorus and weekend effects.
+heat <- det %>% count(weekday, hour, name = "detections")
+
+ggplot(heat, aes(hour, weekday, fill = detections)) +
+  geom_tile() +
+  scale_fill_gradient(low = "#eef6f1", high = "#1b5e3f") +
+  scale_x_continuous(breaks = seq(0, 23, 3)) +
+  labs(title = "Activity by hour and weekday", x = "Hour", y = NULL,
+       fill = "Detections") +
+  theme_minimal(base_size = 12)
+```
+
+## 8. Confidence
+
+```{r confidence-dist}
+ggplot(det, aes(confidence)) +
+  geom_histogram(binwidth = 0.02, fill = "#2e7d5b") +
+  labs(title = "Detection confidence distribution",
+       x = "BirdNET confidence", y = "Detections") +
+  theme_minimal(base_size = 12)
+```
+
+```{r confidence-by-species}
+# Median confidence for the most-heard species — low medians are worth a
+# listen/vote before trusting the ID.
+det %>%
+  group_by(common_name) %>%
+  summarise(detections = n(),
+            median_conf = median(confidence),
+            best_conf   = max(confidence),
+            .groups = "drop") %>%
+  filter(detections >= 10) %>%
+  arrange(median_conf) %>%
+  slice_head(n = 15) %>%
+  kable(digits = 3,
+        col.names = c("Species", "Detections", "Median conf.", "Best conf."))
+```
+
+## 9. The life list
+
+```{r life-list}
+det %>%
+  group_by(common_name, scientific_name) %>%
+  summarise(detections = n(),
+            first_seen  = min(detected_at),
+            last_seen   = max(detected_at),
+            best_conf   = max(confidence),
+            .groups = "drop") %>%
+  arrange(first_seen) %>%
+  kable(digits = 3,
+        col.names = c("Species", "Scientific name", "Detections",
+                      "First heard", "Last heard", "Best conf."))
+```
+
+## 10. Crowd verdicts on clips
+
+```{r voting, eval=TRUE}
+if (nrow(votes) > 0) {
+  tally <- votes %>%
+    group_by(detection_id) %>%
+    summarise(up   = sum(vote > 0),
+              down = sum(vote < 0),
+              net  = sum(vote), .groups = "drop")
+
+  voted <- det %>% inner_join(tally, by = c("id" = "detection_id"))
+
+  cat(sprintf("%d clips have at least one vote.\n", nrow(voted)))
+
+  voted %>%
+    arrange(net) %>%
+    transmute(common_name, detected_at, confidence, up, down, net) %>%
+    slice_head(n = 15) %>%
+    kable(digits = 3,
+          caption = "Most-disputed clips (lowest net score first)")
+} else {
+  cat("No clip votes recorded yet.")
+}
+```
+
+## 11. Disconnect
+
+```{r disconnect}
+dbDisconnect(con)
+```
+
+---
+
+*The Ramble Register — acoustic bird monitoring, Upper West Side, Manhattan.*
+*Edit the queries above or add your own chunks; `det` and `votes` hold all the data.*
