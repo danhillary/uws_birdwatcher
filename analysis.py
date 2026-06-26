@@ -36,9 +36,12 @@ class BirdAnalyzer:
         when = when or datetime.datetime.now()
         sf.write(self._tmp, audio, sample_rate)
 
-        # Ask down to the human-voice threshold too, so a quiet voice below
-        # MIN_CONFIDENCE is still caught for the privacy hold.
-        floor = config.MIN_CONFIDENCE
+        # Ask BirdNET for everything down to the lowest bar in play: the
+        # per-species analysis floor (we apply the real per-species bar after,
+        # in filter_by_confidence) and, when filtering, the human-voice
+        # threshold (so a quiet voice below MIN_CONFIDENCE still triggers the
+        # privacy hold in partition_detections).
+        floor = config.analysis_floor()
         if config.FILTER_HUMAN_VOICE:
             floor = min(floor, config.HUMAN_VOICE_CONF)
 
@@ -59,6 +62,16 @@ class BirdAnalyzer:
             recording = Recording(self._analyzer, self._tmp, **kwargs)
         recording.analyze()
         return recording.detections
+
+
+def filter_by_confidence(detections):
+    """Drop detections that fall below their species' confidence threshold.
+
+    Most species use the global MIN_CONFIDENCE, but noise-prone ones carry a
+    higher bar (a "woodpecker" at 0.55 is far more likely a jackhammer than a
+    bird) — see config.SPECIES_MIN_CONF / config.species_min_conf."""
+    return [d for d in detections
+            if d["confidence"] >= config.species_min_conf(d["common_name"])]
 
 
 def partition_detections(detections):

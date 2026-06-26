@@ -19,7 +19,8 @@ import config
 import db
 import feed
 import storage
-from analysis import BirdAnalyzer, dedupe_per_species, partition_detections
+from analysis import (BirdAnalyzer, dedupe_per_species, filter_by_confidence,
+                      partition_detections)
 
 
 def resolve_device(spec):
@@ -101,7 +102,8 @@ def main():
         f"Listening on '{info['name']}' "
         f"@ {config.SAMPLE_RATE} Hz, {config.SEGMENT_SECONDS}s segments.\n"
         f"Location: {config.LATITUDE}, {config.LONGITUDE} | "
-        f"min confidence: {config.MIN_CONFIDENCE}\n"
+        f"min confidence: {config.MIN_CONFIDENCE} "
+        f"({len(config.SPECIES_MIN_CONF)} per-species overrides)\n"
         f"Saving to: {config.DB_HOST}/{config.DB_NAME} (schema {config.DB_SCHEMA})\n"
         f"Clip uploads: {'on' if clips_s3.enabled() else 'off'} | "
         f"human-voice filter: {'on' if config.FILTER_HUMAN_VOICE else 'off'}\n"
@@ -136,7 +138,10 @@ def main():
             birds, has_voice = partition_detections(
                 analyzer.analyze(audio, config.SAMPLE_RATE, when=when)
             )
-            detections = dedupe_per_species(birds)
+            # partition_detections drops humans/non-birds and applies the
+            # location filter at the global floor; filter_by_confidence then
+            # enforces the stricter per-species bar (e.g. woodpecker vs jackhammer).
+            detections = dedupe_per_species(filter_by_confidence(birds))
 
             stamp = f"{when:%H:%M:%S}"
             if has_voice:

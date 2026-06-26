@@ -270,7 +270,8 @@ variables:
 | `BW_INPUT_DEVICE`   | `UAC`              | Mic name substring (e.g. `MacBook`) or index   |
 | `BW_LAT`            | `40.785`           | Latitude (default: Upper West Side, NYC)       |
 | `BW_LON`            | `-73.975`          | Longitude                                      |
-| `BW_MIN_CONF`       | `0.25`             | Minimum confidence (0–1) to report a detection |
+| `BW_MIN_CONF`       | `0.5`              | Global minimum confidence (0–1) to report a detection |
+| `BW_SPECIES_MIN_CONF`| *(see below)*     | JSON per-species confidence overrides          |
 | `BW_SEGMENT_SECONDS`| `15`               | Length of each recorded segment                |
 | `BW_SAMPLE_RATE`    | `48000`            | Sample rate (BirdNET expects 48 kHz)           |
 | `DB_HOST`           | `localhost`        | PostgreSQL host                                |
@@ -298,6 +299,30 @@ Example (PowerShell): `$env:BW_INPUT_DEVICE="UAC"; .venv\Scripts\python -m captu
 
 > **Update `BW_LAT`/`BW_LON` if the Windows machine is somewhere else** — BirdNET
 > uses location to decide which species are plausible.
+
+### Cutting down false positives
+
+A single mic in a noisy city throws a lot of bad guesses. Woodpecker "drumming"
+is the worst offender — it's acoustically almost identical to a jackhammer or
+hammering on a construction site, so BirdNET routinely reports a woodpecker when
+it's really roadwork.
+
+Two knobs handle this:
+
+- **`BW_MIN_CONF`** raises the global bar (default `0.5`). Higher = fewer false
+  positives but you may miss faint, genuine birds.
+- **`BW_SPECIES_MIN_CONF`** sets a *stricter* bar for noise-prone species. Keys
+  match case-insensitively as a substring of the common name, so `"woodpecker"`
+  covers Downy/Hairy/Red-bellied/etc. in one entry. Your settings merge over the
+  built-in defaults (`woodpecker`, `flicker`, `sapsucker` all at `0.7`); set a
+  species to `0` to opt it back out.
+
+  ```
+  BW_SPECIES_MIN_CONF={"woodpecker": 0.8, "mourning dove": 0.6}
+  ```
+
+  A "Downy Woodpecker" at 0.55 confidence is now dropped (almost certainly a
+  jackhammer); a clear one at 0.72 still comes through.
 
 ## Project layout
 
