@@ -8,3 +8,6 @@ clips/
 .serena/
 .env
 listener.log
+.Rproj.user
+.Rhistory
+.RData

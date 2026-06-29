@@ -1,0 +1,699 @@
+---
+title: "The Ramble Register — exploratory analysis"
+subtitle: "Acoustic bird detections from the Upper West Side"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 9, fig.height = 5, dpi = 110
+)
+```
+
+This notebook connects to the same PostgreSQL database the listener writes to and
+the dashboard reads from, pulls every detection into a data frame, and explores
+it. It reuses the project's `.env` for credentials, so **nothing secret lives in
+this file** — it is safe to commit.
+
+> Read-only by design: every query here is a `SELECT`. Point it at a read-only
+> DB role if you have one.
+
+## 1. Install the R packages (run once)
+
+This chunk does not run automatically. Run it by hand the first time, then leave
+it be.
+
+```{r install, eval=FALSE}
+install.packages(c(
+  "DBI", "RPostgres",   # database connection
+  "dplyr", "tidyr",     # wrangling
+  "lubridate",          # timestamps
+  "ggplot2", "scales",  # plots
+  "knitr",              # tables
+  "isotree"             # optional: isolation-forest outlier detection (§12)
+))
+```
+
+```{r libraries}
+library(DBI)
+library(RPostgres)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(scales)
+library(knitr)
+```
+
+## 2. Credentials & connection
+
+The project keeps its Postgres credentials in a `.env` file next to this
+notebook (the same one `config.py` loads). We read it here so they never have to
+be typed into — or saved in — this document. `.env` is git-ignored.
+
+If you ran the listener/dashboard locally, `.env` already exists. Otherwise copy
+`.env.example` to `.env` and fill in `DB_HOST`, `DB_NAME`, `DB_USER`, `DB_PASS`
+(and `DB_PORT` / `BW_DB_SCHEMA` if non-default).
+
+```{r read-env}
+# Load .env (KEY=VALUE lines) into the R session environment, just like
+# python-dotenv does for the rest of the project.
+if (file.exists(".env")) {
+  readRenviron(".env")
+} else {
+  warning("No .env found — relying on variables already set in the environment.")
+}
+
+# Pull the same variables config.py uses, with the same defaults.
+db_host   <- Sys.getenv("DB_HOST",      "localhost")
+db_port   <- Sys.getenv("DB_PORT",      "5432")
+db_name   <- Sys.getenv("DB_NAME",      "birdwatcher")
+db_user   <- Sys.getenv("DB_USER",      "")
+db_pass   <- Sys.getenv("DB_PASS",      "")
+db_schema <- Sys.getenv("BW_DB_SCHEMA", "birdwatcher")
+tz        <- Sys.getenv("BW_TIMEZONE",  "America/New_York")
+
+# If a full SQLAlchemy-style URL was supplied instead of the parts, unpack it.
+# Form: postgresql+psycopg2://user:pass@host:port/dbname
+db_url <- Sys.getenv("BW_DATABASE_URL", "")
+if (nzchar(db_url)) {
+  m <- regmatches(
+    db_url,
+    regexec("://([^:@/]+)(?::([^@/]*))?@([^:/]+)(?::(\\d+))?/(.+)$", db_url)
+  )[[1]]
+  if (length(m) == 6) {
+    db_user <- m[2]; db_pass <- m[3]; db_host <- m[4]
+    db_port <- ifelse(nzchar(m[5]), m[5], db_port); db_name <- m[6]
+  }
+}
+
+stopifnot(nzchar(db_user))  # fail early with a clear message if .env is empty
+```
+
+```{r connect}
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host     = db_host,
+  port     = as.integer(db_port),
+  dbname   = db_name,
+  user     = db_user,
+  password = db_pass
+)
+
+# Scope unqualified table names to the birdwatcher schema (validated to a safe
+# identifier first, mirroring db.py's _ident check).
+stopifnot(grepl("^[A-Za-z0-9_]+$", db_schema))
+dbExecute(con, sprintf('SET search_path TO "%s"', db_schema))
+```
+
+## 3. Pull the data
+
+Detections are stored as timezone-naive **local** wall-clock time (see
+`config.now_local`). We cast to text in SQL and re-parse with the project's
+timezone so hour-of-day buckets are exactly right regardless of the R session's
+locale.
+
+```{r load-detections}
+det <- dbGetQuery(con, "
+  SELECT id,
+         detected_at::text AS detected_at,
+         common_name,
+         scientific_name,
+         confidence,
+         clip_path,
+         clip_url
+  FROM detections
+  ORDER BY detected_at
+")
+
+det <- det %>%
+  mutate(
+    detected_at = ymd_hms(detected_at, tz = tz),
+    date        = as_date(detected_at),
+    hour        = hour(detected_at),
+    weekday     = wday(detected_at, label = TRUE, week_start = 1),
+    has_clip    = !is.na(clip_url)
+  )
+
+nrow(det)
+```
+
+```{r load-votes}
+# Clip up/down votes (may be empty if no one has voted yet).
+votes <- dbGetQuery(con, "
+  SELECT detection_id, voter, vote, created_at::text AS created_at
+  FROM clip_votes
+")
+nrow(votes)
+```
+
+## 4. Overview
+
+```{r overview}
+overview <- tibble(
+  metric = c("Total detections", "Distinct species", "Days with activity",
+             "First detection", "Latest detection", "Clips with audio"),
+  value  = c(
+    format(nrow(det), big.mark = ","),
+    as.character(n_distinct(det$common_name)),
+    as.character(n_distinct(det$date)),
+    as.character(min(det$detected_at)),
+    as.character(max(det$detected_at)),
+    sprintf("%d (%.0f%%)", sum(det$has_clip), 100 * mean(det$has_clip))
+  )
+)
+kable(overview, col.names = c("", ""))
+```
+
+## 5. Most-heard species
+
+```{r top-species}
+top_species <- det %>%
+  count(common_name, name = "detections") %>%
+  arrange(desc(detections)) %>%
+  slice_head(n = 20)
+
+ggplot(top_species, aes(reorder(common_name, detections), detections)) +
+  geom_col(fill = "#2e7d5b") +
+  coord_flip() +
+  labs(title = "Top 20 species by number of detections",
+       x = NULL, y = "Detections") +
+  theme_minimal(base_size = 12)
+```
+
+## 6. Activity over time
+
+```{r daily-trend}
+daily <- det %>% count(date, name = "detections")
+
+ggplot(daily, aes(date, detections)) +
+  geom_col(fill = "#2e7d5b") +
+  scale_x_date(labels = label_date_short()) +
+  labs(title = "Detections per day", x = NULL, y = "Detections") +
+  theme_minimal(base_size = 12)
+```
+
+```{r cumulative-species}
+# When was each species first heard? A cumulative "life list" curve.
+first_seen <- det %>%
+  group_by(common_name) %>%
+  summarise(first = min(date), .groups = "drop") %>%
+  arrange(first) %>%
+  mutate(cumulative_species = row_number())
+
+ggplot(first_seen, aes(first, cumulative_species)) +
+  geom_step(color = "#2e7d5b", linewidth = 0.8) +
+  labs(title = "Cumulative species heard (life list growth)",
+       x = NULL, y = "Distinct species") +
+  theme_minimal(base_size = 12)
+```
+
+## 7. Daily rhythm (when are birds active?)
+
+```{r diurnal}
+hourly <- det %>% count(hour, name = "detections")
+
+ggplot(hourly, aes(hour, detections)) +
+  geom_col(fill = "#2e7d5b") +
+  scale_x_continuous(breaks = seq(0, 23, 3)) +
+  labs(title = "Detections by hour of day (all dates pooled)",
+       x = "Hour", y = "Detections") +
+  theme_minimal(base_size = 12)
+```
+
+```{r hour-weekday-heatmap}
+# Hour-of-day × day-of-week heatmap — surfaces dawn-chorus and weekend effects.
+heat <- det %>% count(weekday, hour, name = "detections")
+
+ggplot(heat, aes(hour, weekday, fill = detections)) +
+  geom_tile() +
+  scale_fill_gradient(low = "#eef6f1", high = "#1b5e3f") +
+  scale_x_continuous(breaks = seq(0, 23, 3)) +
+  labs(title = "Activity by hour and weekday", x = "Hour", y = NULL,
+       fill = "Detections") +
+  theme_minimal(base_size = 12)
+```
+
+## 8. Confidence
+
+```{r confidence-dist}
+ggplot(det, aes(confidence)) +
+  geom_histogram(binwidth = 0.02, fill = "#2e7d5b") +
+  labs(title = "Detection confidence distribution",
+       x = "BirdNET confidence", y = "Detections") +
+  theme_minimal(base_size = 12)
+```
+
+```{r confidence-by-species}
+# Median confidence for the most-heard species — low medians are worth a
+# listen/vote before trusting the ID.
+det %>%
+  group_by(common_name) %>%
+  summarise(detections = n(),
+            median_conf = median(confidence),
+            best_conf   = max(confidence),
+            .groups = "drop") %>%
+  filter(detections >= 10) %>%
+  arrange(median_conf) %>%
+  slice_head(n = 15) %>%
+  kable(digits = 3,
+        col.names = c("Species", "Detections", "Median conf.", "Best conf."))
+```
+
+## 9. The life list
+
+```{r life-list}
+det %>%
+  group_by(common_name, scientific_name) %>%
+  summarise(detections = n(),
+            first_seen  = min(detected_at),
+            last_seen   = max(detected_at),
+            best_conf   = max(confidence),
+            .groups = "drop") %>%
+  arrange(first_seen) %>%
+  kable(digits = 3,
+        col.names = c("Species", "Scientific name", "Detections",
+                      "First heard", "Last heard", "Best conf."))
+```
+
+## 10. Crowd verdicts on clips
+
+```{r voting, eval=TRUE}
+if (nrow(votes) > 0) {
+  tally <- votes %>%
+    group_by(detection_id) %>%
+    summarise(up   = sum(vote > 0),
+              down = sum(vote < 0),
+              net  = sum(vote), .groups = "drop")
+
+  voted <- det %>% inner_join(tally, by = c("id" = "detection_id"))
+
+  cat(sprintf("%d clips have at least one vote.\n", nrow(voted)))
+
+  voted %>%
+    arrange(net) %>%
+    transmute(common_name, detected_at, confidence, up, down, net) %>%
+    slice_head(n = 15) %>%
+    kable(digits = 3,
+          caption = "Most-disputed clips (lowest net score first)")
+} else {
+  cat("No clip votes recorded yet.")
+}
+```
+
+## 11. Hypothesis: is some "birdsong" actually construction noise?
+
+Construction noise is constrained in ways real birds are not. In NYC the default
+permitted window is **weekday daytime, 7am–6pm** — so construction is essentially
+absent at **dawn** and on **weekends**. Songbirds are the opposite: they peak in
+the dawn chorus and sing every day of the week.
+
+So a species whose detections cluster in weekday business hours, while staying
+nearly silent at dawn and on weekends, behaves like a machine, not a bird. We
+flag those.
+
+```{r construction-window}
+# NYC's default construction window. Adjust if you know the local pattern.
+biz_start <- 7L   # 7am
+biz_end   <- 18L  # 6pm (exclusive)
+
+det <- det %>%
+  mutate(
+    is_weekend  = wday(detected_at, week_start = 1) >= 6,          # Sat/Sun
+    is_business = !is_weekend & hour >= biz_start & hour < biz_end,
+    is_dawn     = hour >= 4 & hour < 7                             # pre-work dawn
+  )
+
+# If detections were spread evenly across the whole week, what fraction would
+# land in the business-hours window? This is the null we test each species against.
+baseline_business <- ((biz_end - biz_start) * 5) / (24 * 7)
+sprintf("Even-spread baseline for the business-hours window: %.1f%%",
+        100 * baseline_business)
+```
+
+```{r construction-suspects}
+suspect <- det %>%
+  group_by(common_name) %>%
+  summarise(
+    n          = n(),
+    n_business = sum(is_business),
+    weekend_share  = mean(is_weekend),
+    dawn_share     = mean(is_dawn),
+    median_conf    = median(confidence),
+    .groups = "drop"
+  ) %>%
+  mutate(business_share = n_business / n) %>%
+  filter(n >= 20) %>%   # need enough detections to say anything
+  rowwise() %>%
+  mutate(
+    # One-sided binomial test: is this species' business-hours share *higher*
+    # than the even-spread baseline by more than chance?
+    p_business = binom.test(n_business, n, p = baseline_business,
+                            alternative = "greater")$p.value
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # "Behaves like construction": daytime-heavy, weekend-light, dawn-light, and
+    # the daytime skew is statistically clear.
+    construction_suspect = business_share > 0.60 &
+                           weekend_share  < 0.10 &
+                           dawn_share     < 0.05 &
+                           p_business     < 0.01
+  ) %>%
+  arrange(desc(business_share))
+
+suspect %>%
+  transmute(common_name, n,
+            business_share, weekend_share, dawn_share,
+            median_conf, p_business, construction_suspect) %>%
+  kable(digits = 3,
+        col.names = c("Species", "n", "Business hrs", "Weekend", "Dawn",
+                      "Median conf.", "p (vs baseline)", "Suspect?"),
+        caption = sprintf(
+          "Per-species timing. Suspect = >60%% in business hours, <10%% weekend, <5%% dawn, p<0.01 (baseline %.0f%%).",
+          100 * baseline_business))
+```
+
+```{r construction-scatter}
+# The tell-tale corner: high business-hours share AND low weekend share
+# (bottom-right) is where construction-like sources sit. Real birds cluster
+# up and to the left.
+ggplot(suspect, aes(business_share, weekend_share)) +
+  geom_hline(yintercept = 0.10, linetype = "dashed", color = "grey60") +
+  geom_vline(xintercept = 0.60, linetype = "dashed", color = "grey60") +
+  geom_point(aes(size = n, color = construction_suspect), alpha = 0.8) +
+  geom_text(data = ~filter(.x, construction_suspect),
+            aes(label = common_name), vjust = -0.9, size = 3,
+            check_overlap = TRUE) +
+  scale_color_manual(values = c("FALSE" = "#2e7d5b", "TRUE" = "#c0392b"),
+                     labels = c("Bird-like", "Construction-like")) +
+  scale_x_continuous(labels = percent) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Timing fingerprint by species",
+       subtitle = "Bottom-right (daytime-heavy, weekend-light) behaves like construction",
+       x = "Share of detections in weekday business hours",
+       y = "Share of detections on weekends",
+       color = NULL, size = "Detections") +
+  theme_minimal(base_size = 12)
+```
+
+```{r construction-hourly-profiles}
+# Hour-of-day shape for the flagged species vs everything else. Birds should
+# show a dawn bump; construction-like sources ramp up at ~7am and stop by ~6pm.
+flagged <- suspect %>% filter(construction_suspect) %>% pull(common_name)
+
+if (length(flagged) > 0) {
+  profile <- det %>%
+    mutate(group = ifelse(common_name %in% flagged,
+                          common_name, "All other species")) %>%
+    count(group, hour) %>%
+    group_by(group) %>%
+    mutate(share = n / sum(n)) %>%   # normalise so shapes are comparable
+    ungroup()
+
+  ggplot(profile, aes(hour, share)) +
+    annotate("rect", xmin = biz_start, xmax = biz_end, ymin = 0, ymax = Inf,
+             alpha = 0.08, fill = "#c0392b") +
+    geom_col(fill = "#2e7d5b") +
+    facet_wrap(~group, scales = "free_y") +
+    scale_x_continuous(breaks = seq(0, 24, 6)) +
+    scale_y_continuous(labels = percent) +
+    labs(title = "Hourly profile: flagged species vs the rest",
+         subtitle = "Shaded band = weekday construction window (7am–6pm)",
+         x = "Hour of day", y = "Share of that group's detections") +
+    theme_minimal(base_size = 11)
+} else {
+  cat("No species met the construction-suspect criteria.\n")
+}
+```
+
+**Reading the result.** A flagged species is a *candidate* for review, not a
+verdict — pull its clips and listen (the `clip_url` column links the audio, and
+the dashboard's vote buttons let the crowd weigh in). Genuine daytime-active,
+city-tolerant birds (e.g. House Sparrow, Rock Pigeon) can also look daytime-heavy,
+so weigh the dawn and weekend shares and the median confidence together before
+concluding it's a jackhammer.
+
+## 12. How do the species differ? A distributional view of timing
+
+The construction check in §11 was one hand-built rule. Here we step back and ask
+the general question: **how does each species distribute itself across the day,
+and which ones are unusual?** We build a temporal *fingerprint* per species, then
+attack it three ways — Kolmogorov–Smirnov tests (who breaks from the community
+rhythm), clustering (how species group), and multivariate outlier scoring
+(isolation forest + Mahalanobis).
+
+We use a continuous **fractional hour** (hour + minutes/60) so the distributions
+are smooth rather than 24 spikes. Only species with enough detections are
+included, since a handful of detections can't describe a distribution.
+
+```{r temporal-keep}
+min_n <- 30   # minimum detections for a species to get a fingerprint
+keep  <- det %>% count(common_name) %>% filter(n >= min_n) %>% pull(common_name)
+
+det_k <- det %>%
+  filter(common_name %in% keep) %>%
+  mutate(frac_hour = hour + minute(detected_at) / 60 + second(detected_at) / 3600)
+
+sprintf("%d species clear the n >= %d bar (of %d heard in total).",
+        length(keep), min_n, n_distinct(det$common_name))
+```
+
+```{r temporal-guard, results="asis"}
+# Everything below needs a handful of species to compare. Bail out cleanly (so
+# Knit still succeeds) if the data is still too thin.
+enough <- length(keep) >= 4
+if (!enough) {
+  cat("> **Not enough species yet** for a distributional comparison — keep the",
+      "listener running and re-knit once more species pass the threshold.\n")
+}
+```
+
+### 12.1 Per-species temporal fingerprints
+
+Each species becomes a row of features: a circular mean hour and *concentration*
+(0 = active all day, 1 = active at one precise time), the entropy of its hourly
+profile (high = spread out), and its weekend / dawn / business-hours shares. The
+circular sine/cosine components are kept as the model-facing version of "mean
+hour" (they avoid the midnight wrap-around that would confuse 23:00 and 00:00).
+
+```{r temporal-fingerprints, eval=enough}
+two_pi <- 2 * pi
+
+# 24-bin normalised hour profile per species (each row sums to 1).
+H <- det_k %>%
+  count(common_name, hour) %>%
+  complete(common_name, hour = 0:23, fill = list(n = 0)) %>%
+  arrange(common_name, hour) %>%
+  group_by(common_name) %>%
+  mutate(share = n / sum(n)) %>%
+  ungroup() %>%
+  select(common_name, hour, share) %>%
+  pivot_wider(names_from = hour, values_from = share)
+
+Hmat <- as.matrix(H[, -1])
+rownames(Hmat) <- H$common_name
+
+# Profile entropy, normalised to 0..1 (1 = perfectly flat across 24 hours).
+hour_entropy <- apply(Hmat, 1, function(p) {
+  p <- p[p > 0]
+  -sum(p * log(p)) / log(24)
+})
+
+feat <- det_k %>%
+  group_by(common_name) %>%
+  summarise(
+    n             = n(),
+    ang_C         = mean(cos(frac_hour / 24 * two_pi)),
+    ang_S         = mean(sin(frac_hour / 24 * two_pi)),
+    weekend_share = mean(is_weekend),
+    dawn_share    = mean(is_dawn),
+    business_share = mean(is_business),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    concentration = sqrt(ang_C^2 + ang_S^2),
+    mean_hour     = (atan2(ang_S, ang_C) %% two_pi) / two_pi * 24,
+    hour_entropy  = hour_entropy[common_name]
+  )
+
+feat %>%
+  transmute(common_name, n, mean_hour, concentration, hour_entropy,
+            dawn_share, business_share, weekend_share) %>%
+  arrange(mean_hour) %>%
+  kable(digits = 3,
+        col.names = c("Species", "n", "Mean hour", "Concentration", "Entropy",
+                      "Dawn", "Business", "Weekend"),
+        caption = "Temporal fingerprint per species (sorted by mean hour of day).")
+```
+
+### 12.2 Kolmogorov–Smirnov: who breaks from the community rhythm?
+
+For each species we run a two-sample K-S test of *its* detection times against
+the times of **all other species pooled**. A large K-S statistic *D* means its
+daily timing departs strongly from the community baseline — exactly the species
+worth a closer look (an odd niche, or a non-bird source).
+
+```{r temporal-ks, eval=enough}
+all_hours <- det_k$frac_hour
+
+ks_one <- function(sp) {
+  x <- det_k$frac_hour[det_k$common_name == sp]
+  y <- det_k$frac_hour[det_k$common_name != sp]
+  t <- suppressWarnings(ks.test(x, y))   # ties (shared seconds) are harmless here
+  data.frame(common_name = sp, D = unname(t$statistic), p_value = t$p.value)
+}
+
+ks <- do.call(rbind, lapply(keep, ks_one)) %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH")) %>%   # control false discovery
+  arrange(desc(D))
+
+ks %>%
+  kable(digits = c(0, 3, 4, 4),
+        col.names = c("Species", "K-S D", "p", "p (BH-adj.)"),
+        caption = "Departure from the community's daily rhythm (largest first).")
+
+ggplot(head(ks, 15), aes(reorder(common_name, D), D)) +
+  geom_col(fill = "#2e7d5b") +
+  coord_flip() +
+  labs(title = "Most distinctive daily timing (K-S vs all other species)",
+       x = NULL, y = "K-S statistic D") +
+  theme_minimal(base_size = 12)
+```
+
+> Caveat: hour-of-day is *circular*, and K-S treats it as a line — it can
+> understate differences that straddle midnight. The concentration metric and the
+> clustering below complement it.
+
+### 12.3 Clustering species by daily rhythm
+
+Treat each species' 24-bin hourly profile as a vector and cluster them (Ward's
+method on Euclidean distance). The dendrogram shows which species keep the same
+hours; the heatmap shows the actual shapes, rows ordered by the clustering.
+
+```{r temporal-cluster, eval=enough, fig.height=6}
+d  <- dist(Hmat)                          # distance between hourly profiles
+hc <- hclust(d, method = "ward.D2")
+k  <- min(4, nrow(Hmat) - 1)              # number of rhythm groups
+cl <- cutree(hc, k = k)
+
+plot(hc, hang = -1, main = "Species clustered by daily rhythm",
+     xlab = "", sub = "", cex = 0.8)
+rect.hclust(hc, k = k, border = "#2e7d5b")
+```
+
+```{r temporal-heatmap, eval=enough, fig.height=6}
+ord <- rownames(Hmat)[hc$order]
+heat_df <- data.frame(common_name = rownames(Hmat), Hmat, check.names = FALSE) %>%
+  pivot_longer(-common_name, names_to = "hour", values_to = "share") %>%
+  mutate(hour = as.integer(hour),
+         common_name = factor(common_name, levels = ord))
+
+ggplot(heat_df, aes(hour, common_name, fill = share)) +
+  geom_tile() +
+  scale_fill_gradient(low = "#f3f8f5", high = "#1b5e3f", labels = percent) +
+  scale_x_continuous(breaks = seq(0, 23, 3)) +
+  labs(title = "Hourly activity profile by species",
+       subtitle = "Rows ordered by the dendrogram above",
+       x = "Hour of day", y = NULL, fill = "Share") +
+  theme_minimal(base_size = 11)
+
+tibble(common_name = names(cl), rhythm_group = cl) %>%
+  arrange(rhythm_group, common_name) %>%
+  kable(col.names = c("Species", "Rhythm group"),
+        caption = "Cluster membership (groups are data-driven, not labelled).")
+```
+
+### 12.4 Outliers: which species' timing is most unusual?
+
+Finally, score each species' full fingerprint for *multivariate* anomaly — not
+just one axis, but the whole feature vector at once. **Isolation forest**
+(`isotree`) isolates points that are easy to separate from the rest; we also
+compute a **Mahalanobis distance** as an always-available baseline. Species
+scoring high on both are the genuine temporal oddballs.
+
+> Mahalanobis needs comfortably more species than features to be stable; with
+> only a handful (as here) the covariance is singular and it automatically falls
+> back to plain (Euclidean) distance from the community centre. Isolation forest
+> degrades more gracefully, so it's the score to lean on — but with very few
+> species *any* anomaly method is suggestive, not conclusive.
+
+```{r temporal-outliers, eval=enough}
+# Model-facing feature matrix (circular components, not the wrap-prone mean hour).
+X <- feat %>%
+  select(ang_C, ang_S, concentration, hour_entropy,
+         dawn_share, business_share, weekend_share)
+Xs <- scale(as.matrix(X))
+rownames(Xs) <- feat$common_name
+
+# Mahalanobis distance from the community centroid. Falls back to plain distance
+# from the centroid if the covariance is singular (highly collinear features).
+md <- tryCatch(
+  mahalanobis(Xs, colMeans(Xs), cov(Xs)),
+  error = function(e) sqrt(rowSums(scale(Xs, scale = FALSE)^2))
+)
+
+# Isolation forest, if the optional package is installed.
+if (requireNamespace("isotree", quietly = TRUE)) {
+  set.seed(1)
+  iso <- isotree::isolation.forest(as.data.frame(Xs), ntrees = 200, ndim = 1)
+  iso_score <- predict(iso, as.data.frame(Xs))   # 0..1, higher = more anomalous
+} else {
+  iso_score <- NA_real_
+  message("Install the 'isotree' package for isolation-forest scores.")
+}
+
+outliers <- feat %>%
+  transmute(common_name, n, mean_hour, concentration) %>%
+  mutate(mahalanobis = md[common_name],
+         iso_score   = if (all(is.na(iso_score))) NA_real_ else iso_score) %>%
+  arrange(desc(mahalanobis))
+
+outliers %>%
+  kable(digits = 3,
+        col.names = c("Species", "n", "Mean hour", "Concentration",
+                      "Mahalanobis", "Isolation-forest"),
+        caption = "Temporal outliers (most unusual fingerprint first).")
+```
+
+```{r temporal-pca, eval=enough}
+# A 2-D map of the fingerprint space: nearby species keep similar hours; the
+# colour shows how anomalous each one is.
+pca <- prcomp(Xs)
+pc  <- as.data.frame(pca$x[, 1:2])
+pc$common_name <- rownames(Xs)
+pc$mahalanobis <- md
+
+ggplot(pc, aes(PC1, PC2, color = mahalanobis)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = common_name), vjust = -0.8, size = 3,
+            check_overlap = TRUE) +
+  scale_color_viridis_c(option = "C") +
+  labs(title = "Species in temporal-fingerprint space (PCA)",
+       subtitle = "Brighter = more unusual daily timing",
+       color = "Mahalanobis") +
+  theme_minimal(base_size = 12)
+```
+
+**How to use this.** The three views agree on the genuinely odd species: a high
+K-S *D*, its own little cluster, and a high anomaly score together are a strong
+signal that something times its "calls" unlike any real bird in the set — your
+prime suspects for construction, machinery, or a misfiring ID. As always, the
+clip audio (`clip_url`) is the final arbiter.
+
+## 13. Disconnect
+
+```{r disconnect}
+dbDisconnect(con)
+```
+
+---
+
+*The Ramble Register — acoustic bird monitoring, Upper West Side, Manhattan.*
+*Edit the queries above or add your own chunks; `det` and `votes` hold all the data.*
