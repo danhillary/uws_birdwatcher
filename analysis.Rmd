@@ -306,7 +306,140 @@ if (nrow(votes) > 0) {
 }
 ```
 
-## 11. Disconnect
+## 11. Hypothesis: is some "birdsong" actually construction noise?
+
+Construction noise is constrained in ways real birds are not. In NYC the default
+permitted window is **weekday daytime, 7am–6pm** — so construction is essentially
+absent at **dawn** and on **weekends**. Songbirds are the opposite: they peak in
+the dawn chorus and sing every day of the week.
+
+So a species whose detections cluster in weekday business hours, while staying
+nearly silent at dawn and on weekends, behaves like a machine, not a bird. We
+flag those.
+
+```{r construction-window}
+# NYC's default construction window. Adjust if you know the local pattern.
+biz_start <- 7L   # 7am
+biz_end   <- 18L  # 6pm (exclusive)
+
+det <- det %>%
+  mutate(
+    is_weekend  = wday(detected_at, week_start = 1) >= 6,          # Sat/Sun
+    is_business = !is_weekend & hour >= biz_start & hour < biz_end,
+    is_dawn     = hour >= 4 & hour < 7                             # pre-work dawn
+  )
+
+# If detections were spread evenly across the whole week, what fraction would
+# land in the business-hours window? This is the null we test each species against.
+baseline_business <- ((biz_end - biz_start) * 5) / (24 * 7)
+sprintf("Even-spread baseline for the business-hours window: %.1f%%",
+        100 * baseline_business)
+```
+
+```{r construction-suspects}
+suspect <- det %>%
+  group_by(common_name) %>%
+  summarise(
+    n          = n(),
+    n_business = sum(is_business),
+    weekend_share  = mean(is_weekend),
+    dawn_share     = mean(is_dawn),
+    median_conf    = median(confidence),
+    .groups = "drop"
+  ) %>%
+  mutate(business_share = n_business / n) %>%
+  filter(n >= 20) %>%   # need enough detections to say anything
+  rowwise() %>%
+  mutate(
+    # One-sided binomial test: is this species' business-hours share *higher*
+    # than the even-spread baseline by more than chance?
+    p_business = binom.test(n_business, n, p = baseline_business,
+                            alternative = "greater")$p.value
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # "Behaves like construction": daytime-heavy, weekend-light, dawn-light, and
+    # the daytime skew is statistically clear.
+    construction_suspect = business_share > 0.60 &
+                           weekend_share  < 0.10 &
+                           dawn_share     < 0.05 &
+                           p_business     < 0.01
+  ) %>%
+  arrange(desc(business_share))
+
+suspect %>%
+  transmute(common_name, n,
+            business_share, weekend_share, dawn_share,
+            median_conf, p_business, construction_suspect) %>%
+  kable(digits = 3,
+        col.names = c("Species", "n", "Business hrs", "Weekend", "Dawn",
+                      "Median conf.", "p (vs baseline)", "Suspect?"),
+        caption = sprintf(
+          "Per-species timing. Suspect = >60%% in business hours, <10%% weekend, <5%% dawn, p<0.01 (baseline %.0f%%).",
+          100 * baseline_business))
+```
+
+```{r construction-scatter}
+# The tell-tale corner: high business-hours share AND low weekend share
+# (bottom-right) is where construction-like sources sit. Real birds cluster
+# up and to the left.
+ggplot(suspect, aes(business_share, weekend_share)) +
+  geom_hline(yintercept = 0.10, linetype = "dashed", color = "grey60") +
+  geom_vline(xintercept = 0.60, linetype = "dashed", color = "grey60") +
+  geom_point(aes(size = n, color = construction_suspect), alpha = 0.8) +
+  geom_text(data = ~filter(.x, construction_suspect),
+            aes(label = common_name), vjust = -0.9, size = 3,
+            check_overlap = TRUE) +
+  scale_color_manual(values = c("FALSE" = "#2e7d5b", "TRUE" = "#c0392b"),
+                     labels = c("Bird-like", "Construction-like")) +
+  scale_x_continuous(labels = percent) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Timing fingerprint by species",
+       subtitle = "Bottom-right (daytime-heavy, weekend-light) behaves like construction",
+       x = "Share of detections in weekday business hours",
+       y = "Share of detections on weekends",
+       color = NULL, size = "Detections") +
+  theme_minimal(base_size = 12)
+```
+
+```{r construction-hourly-profiles}
+# Hour-of-day shape for the flagged species vs everything else. Birds should
+# show a dawn bump; construction-like sources ramp up at ~7am and stop by ~6pm.
+flagged <- suspect %>% filter(construction_suspect) %>% pull(common_name)
+
+if (length(flagged) > 0) {
+  profile <- det %>%
+    mutate(group = ifelse(common_name %in% flagged,
+                          common_name, "All other species")) %>%
+    count(group, hour) %>%
+    group_by(group) %>%
+    mutate(share = n / sum(n)) %>%   # normalise so shapes are comparable
+    ungroup()
+
+  ggplot(profile, aes(hour, share)) +
+    annotate("rect", xmin = biz_start, xmax = biz_end, ymin = 0, ymax = Inf,
+             alpha = 0.08, fill = "#c0392b") +
+    geom_col(fill = "#2e7d5b") +
+    facet_wrap(~group, scales = "free_y") +
+    scale_x_continuous(breaks = seq(0, 24, 6)) +
+    scale_y_continuous(labels = percent) +
+    labs(title = "Hourly profile: flagged species vs the rest",
+         subtitle = "Shaded band = weekday construction window (7am–6pm)",
+         x = "Hour of day", y = "Share of that group's detections") +
+    theme_minimal(base_size = 11)
+} else {
+  cat("No species met the construction-suspect criteria.\n")
+}
+```
+
+**Reading the result.** A flagged species is a *candidate* for review, not a
+verdict — pull its clips and listen (the `clip_url` column links the audio, and
+the dashboard's vote buttons let the crowd weigh in). Genuine daytime-active,
+city-tolerant birds (e.g. House Sparrow, Rock Pigeon) can also look daytime-heavy,
+so weigh the dawn and weekend shares and the median confidence together before
+concluding it's a jackhammer.
+
+## 12. Disconnect
 
 ```{r disconnect}
 dbDisconnect(con)
