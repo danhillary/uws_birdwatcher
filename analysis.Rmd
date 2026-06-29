@@ -35,7 +35,8 @@ install.packages(c(
   "dplyr", "tidyr",     # wrangling
   "lubridate",          # timestamps
   "ggplot2", "scales",  # plots
-  "knitr"               # tables
+  "knitr",              # tables
+  "isotree"             # optional: isolation-forest outlier detection (§12)
 ))
 ```
 
@@ -439,7 +440,254 @@ city-tolerant birds (e.g. House Sparrow, Rock Pigeon) can also look daytime-heav
 so weigh the dawn and weekend shares and the median confidence together before
 concluding it's a jackhammer.
 
-## 12. Disconnect
+## 12. How do the species differ? A distributional view of timing
+
+The construction check in §11 was one hand-built rule. Here we step back and ask
+the general question: **how does each species distribute itself across the day,
+and which ones are unusual?** We build a temporal *fingerprint* per species, then
+attack it three ways — Kolmogorov–Smirnov tests (who breaks from the community
+rhythm), clustering (how species group), and multivariate outlier scoring
+(isolation forest + Mahalanobis).
+
+We use a continuous **fractional hour** (hour + minutes/60) so the distributions
+are smooth rather than 24 spikes. Only species with enough detections are
+included, since a handful of detections can't describe a distribution.
+
+```{r temporal-keep}
+min_n <- 30   # minimum detections for a species to get a fingerprint
+keep  <- det %>% count(common_name) %>% filter(n >= min_n) %>% pull(common_name)
+
+det_k <- det %>%
+  filter(common_name %in% keep) %>%
+  mutate(frac_hour = hour + minute(detected_at) / 60 + second(detected_at) / 3600)
+
+sprintf("%d species clear the n >= %d bar (of %d heard in total).",
+        length(keep), min_n, n_distinct(det$common_name))
+```
+
+```{r temporal-guard, results="asis"}
+# Everything below needs a handful of species to compare. Bail out cleanly (so
+# Knit still succeeds) if the data is still too thin.
+enough <- length(keep) >= 4
+if (!enough) {
+  cat("> **Not enough species yet** for a distributional comparison — keep the",
+      "listener running and re-knit once more species pass the threshold.\n")
+}
+```
+
+### 12.1 Per-species temporal fingerprints
+
+Each species becomes a row of features: a circular mean hour and *concentration*
+(0 = active all day, 1 = active at one precise time), the entropy of its hourly
+profile (high = spread out), and its weekend / dawn / business-hours shares. The
+circular sine/cosine components are kept as the model-facing version of "mean
+hour" (they avoid the midnight wrap-around that would confuse 23:00 and 00:00).
+
+```{r temporal-fingerprints, eval=enough}
+two_pi <- 2 * pi
+
+# 24-bin normalised hour profile per species (each row sums to 1).
+H <- det_k %>%
+  count(common_name, hour) %>%
+  complete(common_name, hour = 0:23, fill = list(n = 0)) %>%
+  arrange(common_name, hour) %>%
+  group_by(common_name) %>%
+  mutate(share = n / sum(n)) %>%
+  ungroup() %>%
+  select(common_name, hour, share) %>%
+  pivot_wider(names_from = hour, values_from = share)
+
+Hmat <- as.matrix(H[, -1])
+rownames(Hmat) <- H$common_name
+
+# Profile entropy, normalised to 0..1 (1 = perfectly flat across 24 hours).
+hour_entropy <- apply(Hmat, 1, function(p) {
+  p <- p[p > 0]
+  -sum(p * log(p)) / log(24)
+})
+
+feat <- det_k %>%
+  group_by(common_name) %>%
+  summarise(
+    n             = n(),
+    ang_C         = mean(cos(frac_hour / 24 * two_pi)),
+    ang_S         = mean(sin(frac_hour / 24 * two_pi)),
+    weekend_share = mean(is_weekend),
+    dawn_share    = mean(is_dawn),
+    business_share = mean(is_business),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    concentration = sqrt(ang_C^2 + ang_S^2),
+    mean_hour     = (atan2(ang_S, ang_C) %% two_pi) / two_pi * 24,
+    hour_entropy  = hour_entropy[common_name]
+  )
+
+feat %>%
+  transmute(common_name, n, mean_hour, concentration, hour_entropy,
+            dawn_share, business_share, weekend_share) %>%
+  arrange(mean_hour) %>%
+  kable(digits = 3,
+        col.names = c("Species", "n", "Mean hour", "Concentration", "Entropy",
+                      "Dawn", "Business", "Weekend"),
+        caption = "Temporal fingerprint per species (sorted by mean hour of day).")
+```
+
+### 12.2 Kolmogorov–Smirnov: who breaks from the community rhythm?
+
+For each species we run a two-sample K-S test of *its* detection times against
+the times of **all other species pooled**. A large K-S statistic *D* means its
+daily timing departs strongly from the community baseline — exactly the species
+worth a closer look (an odd niche, or a non-bird source).
+
+```{r temporal-ks, eval=enough}
+all_hours <- det_k$frac_hour
+
+ks_one <- function(sp) {
+  x <- det_k$frac_hour[det_k$common_name == sp]
+  y <- det_k$frac_hour[det_k$common_name != sp]
+  t <- suppressWarnings(ks.test(x, y))   # ties (shared seconds) are harmless here
+  data.frame(common_name = sp, D = unname(t$statistic), p_value = t$p.value)
+}
+
+ks <- do.call(rbind, lapply(keep, ks_one)) %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH")) %>%   # control false discovery
+  arrange(desc(D))
+
+ks %>%
+  kable(digits = c(0, 3, 4, 4),
+        col.names = c("Species", "K-S D", "p", "p (BH-adj.)"),
+        caption = "Departure from the community's daily rhythm (largest first).")
+
+ggplot(head(ks, 15), aes(reorder(common_name, D), D)) +
+  geom_col(fill = "#2e7d5b") +
+  coord_flip() +
+  labs(title = "Most distinctive daily timing (K-S vs all other species)",
+       x = NULL, y = "K-S statistic D") +
+  theme_minimal(base_size = 12)
+```
+
+> Caveat: hour-of-day is *circular*, and K-S treats it as a line — it can
+> understate differences that straddle midnight. The concentration metric and the
+> clustering below complement it.
+
+### 12.3 Clustering species by daily rhythm
+
+Treat each species' 24-bin hourly profile as a vector and cluster them (Ward's
+method on Euclidean distance). The dendrogram shows which species keep the same
+hours; the heatmap shows the actual shapes, rows ordered by the clustering.
+
+```{r temporal-cluster, eval=enough, fig.height=6}
+d  <- dist(Hmat)                          # distance between hourly profiles
+hc <- hclust(d, method = "ward.D2")
+k  <- min(4, nrow(Hmat) - 1)              # number of rhythm groups
+cl <- cutree(hc, k = k)
+
+plot(hc, hang = -1, main = "Species clustered by daily rhythm",
+     xlab = "", sub = "", cex = 0.8)
+rect.hclust(hc, k = k, border = "#2e7d5b")
+```
+
+```{r temporal-heatmap, eval=enough, fig.height=6}
+ord <- rownames(Hmat)[hc$order]
+heat_df <- data.frame(common_name = rownames(Hmat), Hmat, check.names = FALSE) %>%
+  pivot_longer(-common_name, names_to = "hour", values_to = "share") %>%
+  mutate(hour = as.integer(hour),
+         common_name = factor(common_name, levels = ord))
+
+ggplot(heat_df, aes(hour, common_name, fill = share)) +
+  geom_tile() +
+  scale_fill_gradient(low = "#f3f8f5", high = "#1b5e3f", labels = percent) +
+  scale_x_continuous(breaks = seq(0, 23, 3)) +
+  labs(title = "Hourly activity profile by species",
+       subtitle = "Rows ordered by the dendrogram above",
+       x = "Hour of day", y = NULL, fill = "Share") +
+  theme_minimal(base_size = 11)
+
+tibble(common_name = names(cl), rhythm_group = cl) %>%
+  arrange(rhythm_group, common_name) %>%
+  kable(col.names = c("Species", "Rhythm group"),
+        caption = "Cluster membership (groups are data-driven, not labelled).")
+```
+
+### 12.4 Outliers: which species' timing is most unusual?
+
+Finally, score each species' full fingerprint for *multivariate* anomaly — not
+just one axis, but the whole feature vector at once. **Isolation forest**
+(`isotree`) isolates points that are easy to separate from the rest; we also
+compute a **Mahalanobis distance** as an always-available baseline. Species
+scoring high on both are the genuine temporal oddballs.
+
+> Mahalanobis needs comfortably more species than features to be stable; with
+> only a handful (as here) the covariance is singular and it automatically falls
+> back to plain (Euclidean) distance from the community centre. Isolation forest
+> degrades more gracefully, so it's the score to lean on — but with very few
+> species *any* anomaly method is suggestive, not conclusive.
+
+```{r temporal-outliers, eval=enough}
+# Model-facing feature matrix (circular components, not the wrap-prone mean hour).
+X <- feat %>%
+  select(ang_C, ang_S, concentration, hour_entropy,
+         dawn_share, business_share, weekend_share)
+Xs <- scale(as.matrix(X))
+rownames(Xs) <- feat$common_name
+
+# Mahalanobis distance from the community centroid. Falls back to plain distance
+# from the centroid if the covariance is singular (highly collinear features).
+md <- tryCatch(
+  mahalanobis(Xs, colMeans(Xs), cov(Xs)),
+  error = function(e) sqrt(rowSums(scale(Xs, scale = FALSE)^2))
+)
+
+# Isolation forest, if the optional package is installed.
+if (requireNamespace("isotree", quietly = TRUE)) {
+  set.seed(1)
+  iso <- isotree::isolation.forest(as.data.frame(Xs), ntrees = 200, ndim = 1)
+  iso_score <- predict(iso, as.data.frame(Xs))   # 0..1, higher = more anomalous
+} else {
+  iso_score <- NA_real_
+  message("Install the 'isotree' package for isolation-forest scores.")
+}
+
+outliers <- feat %>%
+  transmute(common_name, n, mean_hour, concentration) %>%
+  mutate(mahalanobis = md[common_name],
+         iso_score   = if (all(is.na(iso_score))) NA_real_ else iso_score) %>%
+  arrange(desc(mahalanobis))
+
+outliers %>%
+  kable(digits = 3,
+        col.names = c("Species", "n", "Mean hour", "Concentration",
+                      "Mahalanobis", "Isolation-forest"),
+        caption = "Temporal outliers (most unusual fingerprint first).")
+```
+
+```{r temporal-pca, eval=enough}
+# A 2-D map of the fingerprint space: nearby species keep similar hours; the
+# colour shows how anomalous each one is.
+pca <- prcomp(Xs)
+pc  <- as.data.frame(pca$x[, 1:2])
+pc$common_name <- rownames(Xs)
+pc$mahalanobis <- md
+
+ggplot(pc, aes(PC1, PC2, color = mahalanobis)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = common_name), vjust = -0.8, size = 3,
+            check_overlap = TRUE) +
+  scale_color_viridis_c(option = "C") +
+  labs(title = "Species in temporal-fingerprint space (PCA)",
+       subtitle = "Brighter = more unusual daily timing",
+       color = "Mahalanobis") +
+  theme_minimal(base_size = 12)
+```
+
+**How to use this.** The three views agree on the genuinely odd species: a high
+K-S *D*, its own little cluster, and a high anomaly score together are a strong
+signal that something times its "calls" unlike any real bird in the set — your
+prime suspects for construction, machinery, or a misfiring ID. As always, the
+clip audio (`clip_url`) is the final arbiter.
+
+## 13. Disconnect
 
 ```{r disconnect}
 dbDisconnect(con)
