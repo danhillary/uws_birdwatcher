@@ -3,7 +3,8 @@
 Captures fixed-length audio segments, runs BirdNET on each (filtered to species
 likely at your location/date), then for every detection: prints it, saves a
 short audio clip, and stores a row in the database. Old clips are pruned to stay
-under the configured storage cap.
+under the configured storage cap. A background thread recomputes the
+false-positive filter flags every BW_FILTER_REFRESH seconds.
 
 Run with:  python -m capture.listen
 Stop with: Ctrl-C
@@ -18,6 +19,7 @@ import clips_s3
 import config
 import db
 import feed
+import filter_refresh
 import storage
 from analysis import BirdAnalyzer, dedupe_per_species, partition_detections
 
@@ -97,6 +99,8 @@ def main():
     print("Loading BirdNET model (first run downloads/initialises, ~10-20s)...")
     analyzer = BirdAnalyzer()
 
+    refresh_txt = (f"refreshed every {config.FILTER_REFRESH_SECONDS}s"
+                   if config.FILTER_REFRESH_SECONDS > 0 else "refresh off")
     print(
         f"Listening on '{info['name']}' "
         f"@ {config.SAMPLE_RATE} Hz, {config.SEGMENT_SECONDS}s segments.\n"
@@ -105,8 +109,13 @@ def main():
         f"Saving to: {config.DB_HOST}/{config.DB_NAME} (schema {config.DB_SCHEMA})\n"
         f"Clip uploads: {'on' if clips_s3.enabled() else 'off'} | "
         f"human-voice filter: {'on' if config.FILTER_HUMAN_VOICE else 'off'}\n"
+        f"False-positive flags: {refresh_txt}\n"
         f"Press Ctrl-C to stop.\n"
     )
+
+    # Recompute the filter flags off the capture thread, so a slow database
+    # round trip never costs recorded audio.
+    filter_refresh.start_background()
 
     host = socket.gethostname()
     last_det = None  # time of the most recent detection, for the heartbeat

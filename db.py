@@ -1,8 +1,11 @@
 """PostgreSQL storage for bird detections.
 
-One table, `detections`, lives in its own schema (``config.DB_SCHEMA``, default
-``birdwatcher``) so it can share a database with other apps without
-colliding. The home listener writes; the cloud dashboard reads.
+The core table, `detections`, lives in its own schema (``config.DB_SCHEMA``,
+default ``birdwatcher``) so it can share a database with other apps without
+colliding. The home listener writes; the cloud dashboard reads. Alongside it,
+the false-positive filter tables hold thresholds, per-detection flags, a
+per-species summary and manual species overrides (see filters.py); raw
+detections are never modified by filtering.
 
 Timestamps are stored as timezone-naive *local* time (see ``config.now_local``)
 so "today" and per-hour buckets are correct regardless of where the dashboard
@@ -13,6 +16,7 @@ import datetime
 from sqlalchemy import bindparam, create_engine, text
 
 import config
+import filters
 
 # Lazily-built singleton engine. pool_pre_ping recycles connections dropped by
 # the server/firewall, which matters for a long-running listener.
@@ -33,6 +37,10 @@ _SCHEMA = _ident(config.DB_SCHEMA)
 _TABLE = f'"{_SCHEMA}".detections'
 _STATUS = f'"{_SCHEMA}".listener_status'
 _VOTES = f'"{_SCHEMA}".clip_votes'
+_FCONFIG = f'"{_SCHEMA}".filter_config'
+_FLAGS = f'"{_SCHEMA}".detection_flags'
+_SPQ = f'"{_SCHEMA}".species_quality'
+_OVERRIDE = f'"{_SCHEMA}".species_override'
 
 
 def get_engine():
@@ -83,10 +91,65 @@ def init_db():
         created_at   TIMESTAMP NOT NULL,
         PRIMARY KEY (detection_id, voter)
     );
+    CREATE TABLE IF NOT EXISTS {_FCONFIG} (
+        name        TEXT PRIMARY KEY,
+        value       DOUBLE PRECISION NOT NULL,
+        description TEXT,
+        updated_at  TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS {_FLAGS} (
+        detection_id    BIGINT PRIMARY KEY
+                        REFERENCES {_TABLE} (id) ON DELETE CASCADE,
+        bout_id         INTEGER,
+        pass_anchor     BOOLEAN NOT NULL,
+        pass_shadow     BOOLEAN NOT NULL,
+        pass_repeat     BOOLEAN NOT NULL,
+        pass_daypattern BOOLEAN NOT NULL,
+        shadowed_by     TEXT,
+        keep            BOOLEAN NOT NULL,
+        removed_by      TEXT,
+        computed_at     TIMESTAMP NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS {_SPQ} (
+        common_name        TEXT PRIMARY KEY,
+        scientific_name    TEXT,
+        raw_count          INTEGER NOT NULL,
+        kept_count         INTEGER NOT NULL,
+        pct_kept           DOUBLE PRECISION,
+        top_removed_by     TEXT,
+        removed_anchor     INTEGER,
+        removed_shadow     INTEGER,
+        removed_repeat     INTEGER,
+        removed_daypattern INTEGER,
+        removed_override   INTEGER,
+        shadow_exempt      BOOLEAN,
+        median_gap_s       DOUBLE PRECISION,
+        gap_cv             DOUBLE PRECISION,
+        cadence_flag       BOOLEAN,
+        computed_at        TIMESTAMP NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS {_OVERRIDE} (
+        common_name TEXT PRIMARY KEY,
+        status      TEXT NOT NULL CHECK (status IN ('confirmed', 'rejected')),
+        note        TEXT,
+        updated_at  TIMESTAMP NOT NULL
+    )
     """
     with get_engine().begin() as conn:
         for stmt in filter(str.strip, ddl.split(";")):
             conn.execute(text(stmt))
+        # Seed every threshold with its default so the table documents them
+        # all. Existing values are kept; only descriptions are refreshed.
+        conn.execute(
+            text(f"""INSERT INTO {_FCONFIG} (name, value, description, updated_at)
+                     VALUES (:name, :value, :description, :ts)
+                     ON CONFLICT (name) DO UPDATE
+                         SET description = EXCLUDED.description"""),
+            [{"name": p.name, "value": float(p.default),
+              "description": p.description,
+              "ts": config.now_local().replace(microsecond=0)}
+             for p in filters.PARAMS],
+        )
 
 
 def insert_detection(detected_at, common_name, scientific_name,
@@ -189,63 +252,62 @@ def recent_detections(conn, limit=50):
     ))
 
 
-def counts_for_day(conn, day):
+def _source(filtered):
+    """FROM clause (detections aliased ``d``) and a WHERE condition.
+
+    Filtered keeps the rows the stored flags keep and applies manual species
+    overrides immediately. Detections newer than the last flag refresh have no
+    flags yet and count as kept until the next refresh judges them."""
+    if not filtered:
+        return f"{_TABLE} d", "TRUE"
+    return (f"""{_TABLE} d
+                LEFT JOIN {_FLAGS} f ON f.detection_id = d.id
+                LEFT JOIN {_OVERRIDE} o ON o.common_name = d.common_name""",
+            """(o.status = 'confirmed'
+                OR (o.status IS DISTINCT FROM 'rejected'
+                    AND COALESCE(f.keep, TRUE)))""")
+
+
+def counts_for_day(conn, day, filtered=False):
     """Per-species counts for a given YYYY-MM-DD date string."""
+    src, keep = _source(filtered)
     return _rows(conn.execute(
-        text(f"""SELECT common_name, scientific_name,
-                        COUNT(*) AS n, MAX(confidence) AS best
-                 FROM {_TABLE}
-                 WHERE detected_at::date = CAST(:day AS date)
-                 GROUP BY common_name, scientific_name
+        text(f"""SELECT d.common_name, d.scientific_name,
+                        COUNT(*) AS n, MAX(d.confidence) AS best
+                 FROM {src}
+                 WHERE d.detected_at::date = CAST(:day AS date) AND {keep}
+                 GROUP BY d.common_name, d.scientific_name
                  ORDER BY n DESC, best DESC"""),
         {"day": day},
     ))
 
 
-def hourly_counts_for_day(conn, day):
-    """Detection counts per hour (0-23) for a given date string."""
-    rows = conn.execute(
-        text(f"""SELECT EXTRACT(HOUR FROM detected_at)::int AS hour, COUNT(*) AS n
-                 FROM {_TABLE}
-                 WHERE detected_at::date = CAST(:day AS date)
-                 GROUP BY hour"""),
-        {"day": day},
-    ).mappings().all()
-    counts = [0] * 24
-    for r in rows:
-        counts[r["hour"]] = r["n"]
-    return counts
-
-
-def life_list(conn):
+def life_list(conn, filtered=False):
     """Every distinct species ever heard, with first-seen and totals."""
+    src, keep = _source(filtered)
     return _rows(conn.execute(
-        text(f"""SELECT common_name, scientific_name,
+        text(f"""SELECT d.common_name, d.scientific_name,
                         COUNT(*) AS total,
-                        MIN(detected_at) AS first_seen,
-                        MAX(detected_at) AS last_seen,
-                        MAX(confidence)  AS best
-                 FROM {_TABLE}
-                 GROUP BY common_name, scientific_name
+                        MIN(d.detected_at) AS first_seen,
+                        MAX(d.detected_at) AS last_seen,
+                        MAX(d.confidence)  AS best
+                 FROM {src}
+                 WHERE {keep}
+                 GROUP BY d.common_name, d.scientific_name
                  ORDER BY first_seen ASC""")
     ))
 
 
-def distinct_days(conn):
-    rows = conn.execute(
-        text(f"SELECT DISTINCT detected_at::date AS d FROM {_TABLE} ORDER BY d DESC")
-    ).mappings().all()
-    return [r["d"].isoformat() for r in rows]
-
-
-def overview(conn):
+def overview(conn, filtered=False):
     """All-time totals for the dashboard's summary cards."""
+    src, keep = _source(filtered)
     row = conn.execute(text(f"""
-        SELECT COUNT(*)                    AS total,
-               COUNT(DISTINCT common_name) AS species,
-               MIN(detected_at)            AS first_at,
-               MAX(detected_at)            AS last_at
-        FROM {_TABLE}
+        SELECT COUNT(*)                      AS total,
+               COUNT(DISTINCT d.common_name) AS species,
+               MIN(d.detected_at)            AS first_at,
+               MAX(d.detected_at)            AS last_at
+        FROM {src}
+        WHERE {keep}
     """)).mappings().first()
     return dict(row) if row else {
         "total": 0, "species": 0, "first_at": None, "last_at": None,
@@ -264,19 +326,6 @@ def listener_status(conn):
         LIMIT 1
     """)).mappings().first()
     return dict(row) if row else None
-
-
-def detections_per_day(conn, days=14):
-    """Daily detection counts for the last `days` days (for a trend chart)."""
-    start = (config.today_local() - datetime.timedelta(days=days - 1)).isoformat()
-    rows = conn.execute(text(f"""
-        SELECT detected_at::date AS day, COUNT(*) AS n
-        FROM {_TABLE}
-        WHERE detected_at::date >= CAST(:start AS date)
-        GROUP BY day
-        ORDER BY day
-    """), {"start": start}).mappings().all()
-    return [dict(r) for r in rows]
 
 
 # --- Clip voting --------------------------------------------------------
@@ -333,3 +382,144 @@ def my_votes(conn, voter, detection_ids):
                 ).bindparams(bindparam("ids", expanding=True))
     return {r["detection_id"]: int(r["vote"])
             for r in conn.execute(stmt, {"voter": voter, "ids": ids}).mappings().all()}
+
+
+# --- False-positive filters ---------------------------------------------
+# filters.py holds the rules; these functions load their inputs and store their
+# outputs. filter_refresh recomputes every flag in one pass (the compute takes a
+# fraction of a second), so there is no incremental bookkeeping to get wrong.
+
+def all_detections(conn):
+    """Every detection as a pandas DataFrame, oldest first: the filter input
+    and the dashboard's data source."""
+    import pandas as pd  # both the dashboard and the listener install pandas
+    return pd.read_sql(
+        text(f"""SELECT id, detected_at, common_name, scientific_name,
+                        confidence, clip_path, clip_url
+                 FROM {_TABLE} ORDER BY detected_at, id"""),
+        conn,
+    )
+
+
+def filter_config(conn):
+    """Stored thresholds: name -> value (floats; filters.resolve_config casts)."""
+    return {r["name"]: r["value"] for r in conn.execute(
+        text(f"SELECT name, value FROM {_FCONFIG}")).mappings().all()}
+
+
+def save_filter_config(values):
+    """Upsert threshold values (name -> number). Opens its own transaction."""
+    ts = config.now_local().replace(microsecond=0)
+    rows = []
+    for name, value in values.items():
+        p = filters.PARAMS_BY_NAME.get(name)
+        if p is None:
+            raise ValueError(f"Unknown filter parameter: {name!r}")
+        rows.append({"name": name, "value": float(value),
+                     "description": p.description, "ts": ts})
+    if not rows:
+        return
+    with get_engine().begin() as conn:
+        conn.execute(
+            text(f"""INSERT INTO {_FCONFIG} (name, value, description, updated_at)
+                     VALUES (:name, :value, :description, :ts)
+                     ON CONFLICT (name) DO UPDATE SET
+                         value = EXCLUDED.value, updated_at = EXCLUDED.updated_at"""),
+            rows,
+        )
+
+
+def species_overrides(conn):
+    """Manual species verdicts: list of {common_name, status, note, updated_at}."""
+    return _rows(conn.execute(text(
+        f"SELECT common_name, status, note, updated_at FROM {_OVERRIDE} "
+        f"ORDER BY common_name")))
+
+
+def set_species_override(common_name, status, note=None):
+    """Mark a species 'confirmed' or 'rejected', or clear it (status None).
+    An override wins over every automatic test."""
+    with get_engine().begin() as conn:
+        if status is None:
+            conn.execute(text(f"DELETE FROM {_OVERRIDE} WHERE common_name = :n"),
+                         {"n": common_name})
+            return
+        if status not in filters.OVERRIDE_STATUSES:
+            raise ValueError(f"Unknown override status: {status!r}")
+        conn.execute(
+            text(f"""INSERT INTO {_OVERRIDE} (common_name, status, note, updated_at)
+                     VALUES (:n, :s, :note, :ts)
+                     ON CONFLICT (common_name) DO UPDATE SET
+                         status = EXCLUDED.status, note = EXCLUDED.note,
+                         updated_at = EXCLUDED.updated_at"""),
+            {"n": common_name, "s": status, "note": note or None,
+             "ts": config.now_local().replace(microsecond=0)},
+        )
+
+
+def _py(v):
+    """numpy/pandas scalar -> plain Python value (NaN/NA -> None) for psycopg2."""
+    if v is None:
+        return None
+    if isinstance(v, float) and v != v:  # NaN
+        return None
+    if hasattr(v, "item"):
+        v = v.item()
+        if isinstance(v, float) and v != v:
+            return None
+    return v
+
+
+def write_filter_results(result, computed_at=None):
+    """Replace the stored flags and species summary with ``result`` (a
+    filters.Result) in one transaction, so readers never see a half-written
+    set. execute_values batches the insert into a few round trips."""
+    from psycopg2.extras import execute_values
+
+    ts = (computed_at or config.now_local()).replace(microsecond=0)
+    flag_rows = [
+        (int(r.id), int(r.bout_id), bool(r.pass_anchor), bool(r.pass_shadow),
+         bool(r.pass_repeat), bool(r.pass_daypattern), _py(r.shadowed_by),
+         bool(r.keep), _py(r.removed_by), ts)
+        for r in result.detections.itertuples(index=False)
+    ]
+    species_rows = [
+        (r.common_name, _py(r.scientific_name), int(r.raw), int(r.kept),
+         _py(r.pct_kept), _py(r.top_removed_by), int(r.removed_anchor),
+         int(r.removed_shadow), int(r.removed_repeat),
+         int(r.removed_daypattern), int(r.removed_override),
+         bool(r.shadow_exempt), _py(r.median_gap_s), _py(r.gap_cv),
+         bool(r.cadence_flag), ts)
+        for r in result.species.itertuples(index=False)
+    ]
+    raw = get_engine().raw_connection()
+    try:
+        with raw.cursor() as cur:
+            cur.execute(f"DELETE FROM {_FLAGS}")
+            if flag_rows:
+                execute_values(cur, f"""INSERT INTO {_FLAGS}
+                    (detection_id, bout_id, pass_anchor, pass_shadow,
+                     pass_repeat, pass_daypattern, shadowed_by, keep,
+                     removed_by, computed_at)
+                    VALUES %s""", flag_rows, page_size=5000)
+            cur.execute(f"DELETE FROM {_SPQ}")
+            if species_rows:
+                execute_values(cur, f"""INSERT INTO {_SPQ}
+                    (common_name, scientific_name, raw_count, kept_count,
+                     pct_kept, top_removed_by, removed_anchor, removed_shadow,
+                     removed_repeat, removed_daypattern, removed_override,
+                     shadow_exempt, median_gap_s, gap_cv, cadence_flag,
+                     computed_at)
+                    VALUES %s""", species_rows, page_size=1000)
+        raw.commit()
+    except Exception:
+        raw.rollback()
+        raise
+    finally:
+        raw.close()
+    return ts
+
+
+def last_filter_refresh(conn):
+    """When the stored flags were last computed, or None."""
+    return conn.execute(text(f"SELECT MAX(computed_at) FROM {_SPQ}")).scalar()
