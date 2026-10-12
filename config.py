@@ -161,3 +161,19 @@ CLIPS_S3_PREFIX = os.environ.get("BW_CLIPS_S3_PREFIX", "birdwatcher/clips").stri
 # NOTE: voting WRITES to the database, so the dashboard's DB user needs
 # INSERT/UPDATE on the birdwatcher schema (read-only credentials disable voting).
 DISPUTED_THRESHOLD = int(os.environ.get("BW_DISPUTED_THRESHOLD", "-3"))
+
+# --- False-positive filters ----------------------------------------------
+
+# Detections are flagged, never deleted, by the shape tests in filters.py. The
+# thresholds live in the birdwatcher.filter_config table (seeded with defaults);
+# these settings only control when the flags are recomputed and who can tune
+# them.
+#
+# Seconds between full recomputes of the stored flags, run on a background
+# thread in the listener. 0 disables (run `python -m filter_refresh` by hand).
+FILTER_REFRESH_SECONDS = int(os.environ.get("BW_FILTER_REFRESH", "600"))
+
+# Passphrase that unlocks the dashboard's admin controls: threshold sliders,
+# saving thresholds, and manual species overrides. Empty = no admin controls
+# (the public toggles still work).
+ADMIN_PASSWORD = os.environ.get("BW_ADMIN_PASSWORD", "")

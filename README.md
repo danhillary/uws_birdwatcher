@@ -8,7 +8,9 @@ The full pipeline is running: a microphone next to the window feeds BirdNET,
 which writes each identified bird to a shared PostgreSQL database; a Streamlit
 dashboard hosted on Posit Connect Cloud reads that database and shows the live
 feed, daily stats, and a life list. Detections are filtered to species likely at
-your location and time of year.
+your location and time of year, and a second layer of shape tests flags likely
+false positives (machine noise, double labels, one-off misfires) without ever
+deleting them.
 
 ## Requirements
 
@@ -116,11 +118,16 @@ terminal** (leave the listener running in the first), start it:
 # macOS:    .venv/bin/streamlit run streamlit_app.py
 ```
 
-Streamlit opens **http://localhost:8501** automatically. Three tabs:
+Streamlit opens **http://localhost:8501** automatically. Four tabs:
 
 - **Live feed** — most recent detections, auto-refreshing, with playable clips
 - **Daily stats** — per-species counts and an activity-by-hour chart (pick a day)
 - **Life list** — every species ever heard, first/last heard, totals
+- **Filter report** — what the false-positive filters keep and remove, per
+  species, with every removed detection listed for checking
+
+A **Filtered / Raw** switch in the sidebar applies to every view (Filtered is the
+default); see *False-positive filters* below.
 
 Below the summary cards a **listener health** pill shows whether the recording
 machine is alive: 🟢 listening (with the live mic level), 🟡 running but the mic
@@ -158,6 +165,65 @@ Voting **writes** to the database, so the dashboard's DB user needs
 `INSERT`/`UPDATE` on the `birdwatcher` schema (the `clip_votes` table is created
 by `init_db`). With a read-only user, the feed still works and just shows a
 "voting unavailable" note.
+
+### False-positive filters
+
+BirdNET at a window logs plenty of detections that are not birds: long strings
+of mediocre guesses from machine noise, a second species name on one sound,
+one-off misfires. Four tests judge the **shape** of the data, not whether a
+species is likely in New York, and **flag** detections rather than delete them.
+The raw `detections` table is never modified.
+
+| # | Test | Rule (defaults) |
+|---|------|-----------------|
+| 1 | Anchored bouts | Group a species' detections into bouts (gaps ≤ 120 s); keep a bout only if one detection reaches 0.6. |
+| 2 | Shadow labels | Drop a detection if another species scored higher within 1.5 s. Species with strong (0.7+) solo calls on 3+ days are exempt: their overlaps are real mixed flocks. |
+| 3 | Repeatability | Keep a species only if it scores 0.7+ on 2+ days, or 3+ times in one bout (a flyover). Judged on rows passing tests 1–2. |
+| 4 | Round-the-clock days | Drop a species' day if it spans 8+ hours, including 2+ between 22:00 and 04:00, and never reaches 0.8. |
+
+**Cadence** (median gap and its coefficient of variation within runs) is shown
+as a diagnostic only. **Manual species overrides** (confirmed / rejected) win
+over every test, for the cases shape tests can't catch, like a species the model
+consistently misidentifies.
+
+How it fits together:
+
+- `filters.py` holds the rules as pure pandas code (no database), so they are
+  unit-tested (`python -m pytest tests`) and fast (well under a second).
+- The dashboard runs them in-process, so the Filtered/Raw switch, the per-test
+  switches and the admin threshold sliders respond instantly. The live feed
+  stays raw (new detections are too fresh to judge) and marks cards the filters
+  would drop.
+- The listener recomputes and stores every flag on a background thread every
+  `BW_FILTER_REFRESH` seconds (default 600), in `detection_flags` and
+  `species_quality`. The phone widget's totals read these; new detections count
+  as kept until the next refresh.
+- Thresholds live in the `filter_config` table (seeded with the defaults) and
+  overrides in `species_override`.
+- Setting `BW_ADMIN_PASSWORD` unlocks admin controls on the Filter report tab:
+  threshold sliders (instant, for the admin only), **Save as defaults**, and
+  species overrides. Saving writes to the database, so on the hosted dashboard
+  it needs a DB user with write access, as voting does.
+
+Refresh or check the filters from the command line:
+
+```bash
+python -m filter_refresh              # recompute and store the flags now
+python -m filter_refresh --dry-run    # compute and print, write nothing
+python -m filter_refresh --validate   # replay the Oct 12, 2026 trial run
+```
+
+`--validate` reruns the rules on the detections the original trial saw and
+checks them against its figures (8,988 of 17,619 detections and 46 of 128
+species kept, plus per-species counts after each test). The trial predated the
+mixed-flock exemption, so validation turns it off. With the exemption on, the
+same window keeps 9,116 detections and the same 46 species.
+
+Known limits: the listener stamps every detection in a 15-second segment with
+the same time, so "within 1.5 s" effectively means "in the same segment", and
+cadence can't see gaps under about 15 s. Test 4 can also catch genuine night
+migration (a few Swamp Sparrow and Blue Grosbeak nights); use an override where
+that matters.
 
 ## iPhone widget (optional)
 
@@ -250,7 +316,8 @@ which builds straight from this GitHub repo:
    every push.
 5. In Connect Cloud's **Variables**, set `DB_HOST`, `DB_PORT`, `DB_NAME`,
    `DB_USER`, `DB_PASS`, and `BW_DB_SCHEMA=birdwatcher` so the dashboard reads
-   the shared database.
+   the shared database. Optionally set `BW_ADMIN_PASSWORD` to enable the
+   filter admin controls.
 
 **The data bridge.** The microphone listener runs on your home machine and
 writes to the shared PostgreSQL database; the cloud-hosted dashboard reads from
@@ -293,6 +360,8 @@ variables:
 | `BW_FILTER_HUMAN_VOICE` | `1`            | Keep clips with a human voice off the public bucket |
 | `BW_HUMAN_VOICE_CONF` | `0.3`            | Confidence at which a human voice triggers the hold |
 | `BW_DISPUTED_THRESHOLD` | `-3`           | Net clip-vote score at/below which a detection is flagged "Disputed" |
+| `BW_FILTER_REFRESH` | `600`              | Seconds between the listener's recomputes of the stored false-positive flags (`0` = off) |
+| `BW_ADMIN_PASSWORD` | *(empty)*          | Passphrase for the dashboard's filter admin controls; empty = no admin controls |
 
 Example (PowerShell): `$env:BW_INPUT_DEVICE="UAC"; .venv\Scripts\python -m capture.listen`
 
@@ -305,6 +374,8 @@ Example (PowerShell): `$env:BW_INPUT_DEVICE="UAC"; .venv\Scripts\python -m captu
 config.py              # central config (location, mic, thresholds, DB, timezone)
 analysis.py            # reusable BirdNET wrapper
 db.py                  # PostgreSQL storage + queries (SQLAlchemy)
+filters.py             # false-positive filter rules (pure pandas, no DB)
+filter_refresh.py      # recompute + store filter flags; --validate replays the trial
 storage.py             # clip saving + storage-cap pruning
 feed.py                # publishes the iPhone-widget JSON feed to S3 (optional)
 clips_s3.py            # uploads detection clips to S3 for cloud playback (optional)
@@ -316,6 +387,9 @@ widget/
   RambleRegister.js    # Scriptable iPhone widget (reads the S3 feed)
 requirements.txt       # slim dashboard deps (Connect Cloud installs these)
 requirements-listen.txt# adds the BirdNET + microphone stack (home machine only)
+requirements-dev.txt   # test tools (pytest)
+tests/
+  test_filters.py      # unit tests for each filter rule
 .env.example           # template for DB credentials (copy to .env)
 ```
 
@@ -338,3 +412,8 @@ requirements-listen.txt# adds the BirdNET + microphone stack (home machine only)
   straight from memory and live in **S3 only** (never written to local disk) and
   are never pruned from the bucket; only human-voice holds and failed-upload
   fallbacks are kept locally ✅.
+- **Phase 7 (done)** — false-positive filters: four shape tests flag likely
+  false positives without deleting them; Filtered/Raw and per-test switches on
+  every view; a Filter report tab with per-species summary and removed
+  detections; admin threshold sliders and species overrides; stored flags for
+  the phone widget; validated against the Oct 2026 trial run ✅.

@@ -97,11 +97,14 @@ def build_feed():
     now = config.now_local()
     today = config.today_local()
 
+    # Totals, today's tally and new species use the false-positive filters,
+    # matching the dashboard's default view. The latest bird stays raw, like the
+    # dashboard's live feed: it is usually too new to have been judged.
     with db.get_conn() as conn:
         recent = db.recent_detections(conn, limit=1)
-        counts = db.counts_for_day(conn, today.isoformat())
-        overview = db.overview(conn)
-        life = db.life_list(conn)
+        counts = db.counts_for_day(conn, today.isoformat(), filtered=True)
+        overview = db.overview(conn, filtered=True)
+        life = db.life_list(conn, filtered=True)
         status = db.listener_status(conn)
 
     feed = {
