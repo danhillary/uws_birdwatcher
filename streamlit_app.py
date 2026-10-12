@@ -1,5 +1,6 @@
 """Birdwatcher dashboard (Streamlit) — live feed, daily stats, life list,
-seasonal and daily insights, and the false-positive filter report.
+bird profiles, seasonal and daily insights, and the false-positive filter
+report.
 
 Reads the shared PostgreSQL database written by the microphone listener, so it
 works both locally and when hosted on Posit Connect Cloud (Streamlit framework,
@@ -17,10 +18,12 @@ import datetime
 import hmac
 import json
 import os
+import re
 import sys
 import urllib.parse
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 # Ensure local modules (config, db) are importable regardless of how the host
 # launches this script. Posit Connect Cloud doesn't always put the project root
@@ -28,10 +31,13 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 from sqlalchemy.exc import SQLAlchemyError
 
+import acoustics
+import bird_profile
 import config
 import db
 import filter_refresh
@@ -518,7 +524,10 @@ st.divider()
 
 # --- Reusable table builders ---------------------------------------------
 
-def _species_table(records, extra_config=None):
+def _species_table(records, extra_config=None, select_key=None):
+    """A species table. With ``select_key``, selecting a row opens that bird's
+    profile in a pop-up (the table then redraws unselected, so the same row
+    can be picked again)."""
     df = pd.DataFrame(records)
     colcfg = {
         "Photo": st.column_config.ImageColumn("", width="small"),
@@ -528,7 +537,22 @@ def _species_table(records, extra_config=None):
     if not show_photos and "Photo" in df.columns:
         df = df.drop(columns=["Photo"])
         colcfg.pop("Photo", None)
-    st.dataframe(df, hide_index=True, width="stretch", column_config=colcfg)
+    if not select_key or "Species" not in df.columns:
+        st.dataframe(df, hide_index=True, width="stretch", column_config=colcfg)
+        return
+    version = st.session_state.get(f"{select_key}_v", 0)
+    key = f"{select_key}_{version}"
+    names = list(df["Species"])
+
+    def _picked():
+        rows = st.session_state[key].selection.rows
+        if rows:
+            st.session_state.open_profile = names[rows[0]]
+            st.session_state[f"{select_key}_v"] = version + 1
+
+    st.dataframe(df, hide_index=True, width="stretch", column_config=colcfg,
+                 key=key, on_select=_picked, selection_mode="single-row")
+    st.caption("Select a row to open that bird's profile.")
 
 
 def _conf_col(label="Confidence"):
@@ -663,7 +687,7 @@ def _detection_card(group, tally, mine, removed_by=None):
                            f"[open ↗]({ref['audio']}) (Ogg — use the link on "
                            "Safari/iOS).")
 
-        c_up, c_down, _rest = st.columns([1, 1, 4])
+        c_up, c_down, c_prof, _rest = st.columns([1, 1, 1.4, 2.6])
         if c_up.button(f"\U0001F44D {up}", key=f"up_{did}", width="stretch",
                        type="primary" if mine == 1 else "secondary",
                        help="This clip matches the species"):
@@ -674,12 +698,19 @@ def _detection_card(group, tally, mine, removed_by=None):
                          help="This clip doesn't match the species"):
             _cast_vote(did, -1, mine)
             st.rerun(scope="fragment")
+        if c_prof.button("\U0001F426 Profile", key=f"prof_{did}", width="stretch",
+                         help=f"Open the {r['common_name']} profile"):
+            st.session_state.open_profile = r["common_name"]
+            st.rerun()  # whole app, so the pop-up opens outside this fragment
 
 
 # --- Tabs ----------------------------------------------------------------
 
-feed_tab, stats_tab, life_tab, insights_tab, report_tab = st.tabs(
-    ["Live feed", "Daily stats", "Life list", "Insights", "Filter report"])
+feed_tab, stats_tab, life_tab, birds_tab, insights_tab, report_tab = st.tabs(
+    ["Live feed", "Daily stats", "Life list", "Birds", "Insights",
+     "Filter report"],
+    key="main_tab", on_change="rerun",
+    default="Birds" if st.query_params.get("bird") else None)
 
 with feed_tab:
     st.subheader("Live feed")
@@ -791,6 +822,7 @@ with stats_tab:
                 for r in counts.itertuples(index=False)
             ],
             _conf_col("Best confidence"),
+            select_key="day_pick",
         )
     else:
         st.info("No detections on this day.")
@@ -824,6 +856,7 @@ with life_tab:
                 for r in life.itertuples(index=False)
             ],
             _conf_col("Best"),
+            select_key="life_pick",
         )
     else:
         st.info("No species heard yet.")
@@ -1190,6 +1223,521 @@ with insights_tab:
                          width="stretch")
 
 
+# --- Bird profiles -------------------------------------------------------
+# One bird at a time: what it is, when and how it calls, what it sounds like,
+# and how it differs from the others. Shown in the Birds tab (searchable, with a
+# shareable ?bird= link) and in a pop-up opened by clicking a bird elsewhere.
+# Like every view, it reads the filtered rows in Filtered mode.
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def species_summary(common_name, scientific_name):
+    """A short Wikipedia summary and page link for a species, or {}."""
+    for title in (common_name, scientific_name):
+        if not title:
+            continue
+        try:
+            data = _wiki_json(title, "summary")
+        except Exception:
+            continue
+        text = (data.get("extract") or "").strip()
+        page = ((data.get("content_urls") or {}).get("desktop") or {}).get("page")
+        if text:
+            return {"extract": text, "page": page}
+    return {}
+
+
+def _all_about_birds_url(common_name):
+    slug = re.sub(r"[^A-Za-z0-9 \-]", "", common_name).strip().replace(" ", "_")
+    return "https://www.allaboutbirds.org/guide/" + urllib.parse.quote(slug)
+
+
+def _short(text, limit=420):
+    """The first sentences of ``text`` up to about ``limit`` characters."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    end = cut.rfind(". ")
+    return cut[:end + 1] if end > 120 else cut.rstrip() + "…"
+
+
+@st.cache_data(ttl=3600, max_entries=60, show_spinner=False)
+def load_profile(key, filtered, name):
+    res = compute_filters(*key)
+    det = res.detections
+    view = det[det["keep"].astype(bool)] if filtered else det
+    cfg = res.config
+    pk = {"bout_gap_s": cfg["bout_gap_s"], "run_gap_s": cfg["cadence_run_gap_s"]}
+    lat, lon, tz = config.LATITUDE, config.LONGITUDE, config.TIMEZONE
+    mine = view[view["common_name"] == name]
+    clips = (mine[mine["clip_url"].notna()]
+             .sort_values(["confidence", "detected_at"], ascending=False)
+             .head(10)[["id", "detected_at", "confidence", "clip_url"]])
+    # One clip per well-recorded species for the all-bird pitch baseline,
+    # chosen from detections before today so the set (and its cache) holds
+    # steady through the day.
+    before = view[(view["clip_url"].notna())
+                  & (view["detected_at"].dt.date < config.today_local())]
+    counts = before["common_name"].value_counts()
+    best = (before[before["common_name"].isin(counts[counts >= 5].index)]
+            .sort_values(["confidence", "id"], ascending=False)
+            .drop_duplicates("common_name"))
+    srow = res.species[res.species["common_name"] == name]
+    return {
+        "scientific": mine["scientific_name"].dropna().iloc[0]
+        if mine["scientific_name"].notna().any() else None,
+        "glance": bird_profile.at_a_glance(view, det, name),
+        "weekly": bird_profile.weekly(view, det, name),
+        "hourly": bird_profile.hourly_vs_all(view, name),
+        "callout": bird_profile.period_callout(view, name),
+        "dawn": bird_profile.dawn(view, name, lat, lon, tz),
+        "pattern": bird_profile.calling_pattern(view, name, **pk),
+        "companions": bird_profile.companions(view, name),
+        "confidence": bird_profile.confidence_vs_all(view, name),
+        "distinctive": bird_profile.distinctive(view, det, name, **pk),
+        "filter": srow.iloc[0].to_dict() if len(srow) else None,
+        "clips": clips.to_dict("records"),
+        "baseline_urls": tuple(best.sort_values("common_name")["clip_url"]),
+    }
+
+
+def _analyze_url(url):
+    try:
+        return acoustics.analyze(acoustics.fetch(url))
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=86400, max_entries=120, show_spinner=False)
+def load_clip_sounds(urls):
+    """Spectrogram and pitch signature for each clip URL (None on failure)."""
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        return list(pool.map(_analyze_url, urls))
+
+
+@st.cache_data(ttl=86400, max_entries=4, show_spinner=False)
+def load_baseline_signature(urls):
+    """The all-bird pitch signature: the mean over one clip per species."""
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        found = [a for a in pool.map(_analyze_url, urls) if a]
+    return acoustics.mean_signature([a["signature"] for a in found])
+
+
+_AVERAGE = "#9aa9a4"  # the all-bird average in comparison charts
+
+
+def _vs_all_color():
+    return alt.Color("series:N", title=None,
+                     scale=alt.Scale(domain=["This bird", "All birds"],
+                                     range=[_GREEN, _AVERAGE]),
+                     legend=alt.Legend(orient="top"))
+
+
+def _vs_all_dash():
+    return alt.StrokeDash("series:N", legend=None,
+                          scale=alt.Scale(domain=["This bird", "All birds"],
+                                          range=[[1, 0], [5, 4]]))
+
+
+_STATUS_COLOURS = {
+    "Resident": ("#eaf7ef", "#4c9a6a"), "Occasional": ("#eef3f5", "#5a7d72"),
+    "Arrived": ("#eaf4f7", "#4f93a6"), "Departed": ("#f4f1ea", "#8a7a52"),
+    "Passing through": ("#eaf4f7", "#4f93a6"),
+    "Rare visitor": ("#f4f1ea", "#8a7a52"),
+}
+
+
+def _khz(hz):
+    return f"{hz / 1000:.1f} kHz"
+
+
+def _profile_header(name, p, res, filtered, where):
+    sci = p["scientific"]
+    g = p["glance"]
+    photo = species_photo(name, sci) if show_photos else None
+    left, right = st.columns([1, 4], vertical_alignment="top")
+    if photo:
+        left.image(photo, width=180)
+    with right:
+        st.markdown(f"### {name}")
+        bits = [f"*{sci}*"] if sci else []
+        if g and g["status"]:
+            bg, fg = _STATUS_COLOURS.get(g["status"], ("#eef3f5", "#5a7d72"))
+            bits.append(
+                f"<span style='background:{bg};color:{fg};border:1px solid {fg};"
+                f"border-radius:999px;padding:1px 10px;font-size:0.82rem;"
+                f"font-weight:600'>{g['status']}</span> "
+                f"<span style='color:#5a7d72;font-size:0.88rem'>"
+                f"{g['status_detail']}</span>")
+        st.markdown(" &nbsp; ".join(bits), unsafe_allow_html=True)
+
+        phrases, compared = p["distinctive"]
+        if phrases:
+            st.markdown("**What stands out:** " + ", ".join(phrases)
+                        + f" (compared with the {compared} birds heard often "
+                        "enough to compare).")
+        elif phrases is None:
+            st.caption("Too few detections to compare with the other birds.")
+        else:
+            st.markdown("**What stands out:** nothing unusual; it is fairly "
+                        "typical of the birds heard here.")
+
+    f = p["filter"]
+    if f is not None:
+        removed = int(f["raw"]) - int(f["kept"])
+        if not filtered and int(f["kept"]) == 0:
+            st.warning(
+                "The false-positive filters remove every detection of this "
+                f"species (mostly {_test_label(f['top_removed_by']).lower()}). "
+                "It is shown because Raw is selected in the sidebar.")
+        elif filtered and removed > 0:
+            st.caption(f"Based on the {int(f['kept']):,} detections that pass "
+                       f"the filters; {removed:,} more were flagged as likely "
+                       "false positives.")
+
+    info = species_summary(name, sci)
+    if info.get("extract"):
+        st.markdown(_short(info["extract"]))
+    links = []
+    if info.get("page"):
+        links.append(f"[Wikipedia ↗]({info['page']})")
+    links.append(f"[All About Birds ↗]({_all_about_birds_url(name)})")
+    st.markdown(" · ".join(links))
+    ref = species_reference(name, sci)
+    if ref.get("audio") and st.toggle("\U0001F50A Hear a reference recording",
+                                      key=f"{where}_ref_{name}"):
+        st.audio(ref["audio"])
+        st.caption("Via Wikimedia Commons · "
+                   f"[open ↗]({ref['audio']}) (Ogg — use the link on Safari/iOS).")
+
+
+def _profile_tiles(g):
+    c = st.columns(5)
+    c[0].metric("Detections", f"{g['detections']:,}",
+                help=f"Number {g['rank']} of {g['species_count']} birds by "
+                     "detections.")
+    c[1].metric(f"Days heard (of {g['days_listened']})", g["days_heard"],
+                help="Days it was heard, out of days the listener ran.")
+    c[2].metric("First heard", _fmt_day(g["first_heard"]))
+    c[3].metric("Last heard", _fmt_day(g["last_heard"]))
+    c[4].metric("Best confidence", f"{g['best_confidence']:.0%}")
+
+
+def _profile_season(p, where):
+    w = p["weekly"].copy()
+    if w.empty:
+        return
+    st.markdown("#### Its season")
+    st.caption("Share of each week's listening days it was heard.")
+    w["week_label"] = _week_label(w["week"]).values
+    weeks = list(w["week_label"])
+    w["pct"] = w["share"].fillna(0)
+    w["heard"] = [("Listener offline" if l == 0 else f"{h} of {l} days")
+                  for h, l in zip(w["days_heard"], w["days_listened"])]
+    x = alt.X("week_label:O", title=None, scale=alt.Scale(domain=weeks),
+              axis=alt.Axis(labelAngle=-45, ticks=False))
+    tip = [alt.Tooltip("week_label:N", title="Week of"),
+           alt.Tooltip("heard:N", title="Heard on")]
+    bars = alt.Chart(w[w["days_heard"] > 0]).mark_bar(
+        color=_GREEN, cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
+        x=x, tooltip=tip,
+        y=alt.Y("pct:Q", title="Days heard", scale=alt.Scale(domain=[0, 1]),
+                axis=alt.Axis(format="%", gridColor="#e2eef0", tickCount=4)))
+    off = alt.Chart(w[w["days_listened"] == 0].assign(y=0.02)).mark_text(
+        text="offline", angle=270, align="left", baseline="middle",
+        color=_MUTED, fontSize=11).encode(x=x, y="y:Q", tooltip=tip)
+    st.altair_chart(alt.layer(bars, off).properties(height=200),
+                    width="stretch", key=f"{where}_season")
+
+
+def _profile_day(p, where):
+    h = p["hourly"]
+    st.markdown("#### Its day, against the average bird")
+    if p["callout"]:
+        st.caption(p["callout"])
+    long = pd.concat([
+        pd.DataFrame({"hour": h["hour"], "share": h["bird_share"],
+                      "series": "This bird"}),
+        pd.DataFrame({"hour": h["hour"], "share": h["all_share"],
+                      "series": "All birds"})])
+    long["hours"] = [f"{x:02d}:00–{(x + 1) % 24:02d}:00" for x in long["hour"]]
+    base = alt.Chart(long).encode(
+        x=alt.X("hour:Q", title="Hour of day", scale=alt.Scale(domain=[0, 23]),
+                axis=alt.Axis(values=list(range(0, 24, 3)),
+                              labelExpr=_HOUR_LABEL, gridColor="#e2eef0")),
+        y=alt.Y("share:Q", title="Share of calls",
+                axis=alt.Axis(format="%", gridColor="#e2eef0", tickCount=4)),
+        color=_vs_all_color(),
+        tooltip=[alt.Tooltip("series:N", title=""),
+                 alt.Tooltip("hours:N", title="Hour"),
+                 alt.Tooltip("share:Q", title="Share", format=".0%")])
+    lines = base.mark_line(strokeWidth=2, interpolate="monotone").encode(
+        strokeDash=_vs_all_dash())
+    dots = base.transform_filter(alt.datum.series == "This bird").mark_circle(
+        size=40, opacity=1)
+    st.altair_chart((lines + dots).properties(height=220),
+                    width="stretch", key=f"{where}_day")
+
+
+def _profile_dawn(p):
+    d = p["dawn"]
+    st.markdown("#### At dawn")
+    if d["rank"]:
+        st.markdown(f"Usually starts **{_rel_sunrise(d['median_min'])}**, "
+                    f"number {d['rank']} of the {d['ranked']} birds heard at "
+                    "dawn on 5 or more days.")
+    elif d["days"]:
+        st.markdown(f"Heard at dawn on {d['days']} day"
+                    f"{'' if d['days'] == 1 else 's'}, typically "
+                    f"{_rel_sunrise(d['median_min'])}.")
+    else:
+        st.markdown("Not heard in the dawn window (90 minutes before to "
+                    "4 hours after sunrise).")
+
+
+def _fmt_metric(v, kind):
+    if v is None or pd.isna(v):
+        return "—"
+    if kind == "calls":
+        return f"{v:g}"
+    if kind == "minutes":
+        return f"{v:.1f} min" if v >= 1 else f"{v * 60:.0f} s"
+    if kind == "seconds":
+        return f"{v:.0f} s"
+    return f"{v:.2f}"
+
+
+def _profile_pattern(p):
+    bird, typical = p["pattern"]
+    st.markdown("#### How it calls")
+    if not bird:
+        return
+    rows = [("Calls per bout", "calls_per_bout", "calls"),
+            ("Bout length", "bout_minutes", "minutes"),
+            ("Gap between calls", "gap_s", "seconds"),
+            ("Irregularity (lower is steadier)", "gap_cv", "ratio")]
+    st.dataframe(pd.DataFrame({
+        "": [r[0] for r in rows],
+        "This bird": [_fmt_metric(bird.get(k), kind) for _, k, kind in rows],
+        "Typical bird": [_fmt_metric(typical.get(k), kind) for _, k, kind in rows],
+    }), hide_index=True, width="stretch")
+    st.caption(f"From {int(bird['bouts']):,} bouts (calls less than "
+               "two minutes apart). The listener logs at most one detection "
+               "per species every 15 seconds, so faster calling looks like "
+               "15-second gaps.")
+
+
+def _spectrogram_chart(a, key):
+    db = a["spectrogram"]
+    n_bands, steps = db.shape
+    df = pd.DataFrame({
+        "t": np.repeat(np.arange(steps), n_bands) * a["step_s"],
+        "f": np.tile(acoustics.band_centres_hz() / 1000, steps),
+        "db": db.T.reshape(-1),
+    })
+    df["t2"] = df["t"] + a["step_s"]
+    df["f2"] = df["f"] + acoustics.BAND_HZ / 1000
+    df["f"] = df["f"] - acoustics.BAND_HZ / 2000
+    df["f2"] = df["f2"] - acoustics.BAND_HZ / 2000
+    chart = alt.Chart(df).mark_rect().encode(
+        x=alt.X("t:Q", title="Seconds", scale=alt.Scale(domain=[0, steps * a["step_s"]],
+                                                        nice=False),
+                axis=alt.Axis(tickCount=5, grid=False)),
+        x2="t2:Q",
+        y=alt.Y("f:Q", title="kHz", scale=alt.Scale(domain=[0, 12], nice=False),
+                axis=alt.Axis(values=[0, 2, 4, 6, 8, 10, 12], grid=False)),
+        y2="f2:Q",
+        color=alt.Color("db:Q", legend=None,
+                        # Quiet parts take the palest green, not the page
+                        # colour, so the whole clip reads as one plot.
+                        scale=alt.Scale(domain=[acoustics.FLOOR_DB, 0],
+                                        range=_RAMP)),
+        tooltip=[alt.Tooltip("t:Q", title="Seconds", format=".2f"),
+                 alt.Tooltip("f:Q", title="kHz", format=".2f"),
+                 alt.Tooltip("db:Q", title="dB below peak", format=".0f")],
+    ).properties(height=180)
+    st.altair_chart(chart, width="stretch", key=key)
+
+
+def _profile_sound(p, where):
+    st.markdown("#### What it sounds like")
+    clips = p["clips"]
+    if not clips:
+        st.info("No clips of this bird are stored.")
+        return
+    with st.spinner("Analysing its clips…"):
+        sounds = load_clip_sounds(tuple(c["clip_url"] for c in clips))
+        baseline = (load_baseline_signature(p["baseline_urls"])
+                    if p["baseline_urls"] else None)
+    ok = [(c, s) for c, s in zip(clips, sounds) if s]
+    if not ok:
+        st.info("Its clips could not be loaded right now.")
+        return
+    st.caption("Spectrograms of its three most confident clips: time across, "
+               "pitch up, darker is louder. Low rumble under 0.5 kHz is "
+               "usually traffic.")
+    cols = st.columns(min(3, len(ok)))
+    for col, (c, s) in zip(cols, ok[:3]):
+        with col:
+            _spectrogram_chart(s, key=f"{where}_spec_{c['id']}")
+            st.audio(c["clip_url"])
+            st.caption(f"{_fmt_day(c['detected_at'])} "
+                       f"{c['detected_at']:%H:%M} · {c['confidence']:.0%}")
+
+    sig = acoustics.mean_signature([s["signature"] for _, s in ok])
+    peak, lo, hi = acoustics.signature_stats(sig)
+    if peak is None:
+        st.caption("No call stood out clearly from the background in its "
+                   "clips, so there is no pitch signature to show.")
+        return
+    centres = acoustics.band_centres_hz() / 1000
+    parts = [pd.DataFrame({"khz": centres, "share": sig, "series": "This bird"})]
+    text = (f"Across {len(ok)} of its clips, its calls are loudest around "
+            f"**{_khz(peak)}**, with the middle half of their energy between "
+            f"{_khz(lo)} and {_khz(hi)}")
+    if baseline is not None:
+        parts.append(pd.DataFrame({"khz": centres, "share": baseline,
+                                   "series": "All birds"}))
+        bpeak, blo, bhi = acoustics.signature_stats(baseline)
+        if blo is not None:
+            text += (f". Across all birds the middle half sits between "
+                     f"{_khz(blo)} and {_khz(bhi)}")
+    st.markdown("**Pitch signature.** " + text + ". It counts only sound "
+                "that rises well above the background, so steady traffic and "
+                "hum drop out.")
+    long = pd.concat(parts)
+    long = long[long["khz"] >= acoustics.SIGNATURE_MIN_HZ / 1000]
+    st.altair_chart(alt.Chart(long).mark_line(strokeWidth=2, interpolate="monotone")
+                    .encode(
+        x=alt.X("khz:Q", title="Pitch (kHz)", scale=alt.Scale(domain=[0.5, 12]),
+                axis=alt.Axis(gridColor="#e2eef0")),
+        y=alt.Y("share:Q", title="Share of energy",
+                axis=alt.Axis(format="%", gridColor="#e2eef0", tickCount=4)),
+        color=_vs_all_color(), strokeDash=_vs_all_dash(),
+        tooltip=[alt.Tooltip("series:N", title=""),
+                 alt.Tooltip("khz:Q", title="kHz", format=".2f"),
+                 alt.Tooltip("share:Q", title="Share", format=".1%")],
+    ).properties(height=200), width="stretch", key=f"{where}_pitch")
+
+
+def _profile_company(p):
+    c = p["companions"]
+    st.markdown("#### Often heard with")
+    if c.empty:
+        st.caption("No other bird is heard alongside it noticeably more often "
+                   "than chance.")
+        return
+    st.dataframe(pd.DataFrame({
+        "Species": c["common_name"],
+        "Shared 15-minute windows": c["shared"],
+        "Share of its windows": (c["share"] * 100).round(0).astype(int).astype(str) + "%",
+        "Compared with chance": [f"{x:.1f}× as often" for x in c["lift"]],
+    }), hide_index=True, width="stretch")
+
+
+def _profile_reliability(p, where):
+    st.markdown("#### How sure the model is")
+    conf = p["confidence"]
+    long = pd.concat([
+        pd.DataFrame({"conf": conf["bin_start"], "share": conf["bird_share"],
+                      "series": "This bird"}),
+        pd.DataFrame({"conf": conf["bin_start"], "share": conf["all_share"],
+                      "series": "All birds"})])
+    long["range"] = [f"{c:.0%}–{min(c + 0.05, 1):.0%}" for c in long["conf"]]
+    color = _vs_all_color()
+    tip = [alt.Tooltip("series:N", title=""),
+           alt.Tooltip("range:N", title="Confidence"),
+           alt.Tooltip("share:Q", title="Share", format=".0%")]
+    x = alt.X("conf:Q", title="Confidence", scale=alt.Scale(domain=[0.25, 1]),
+              axis=alt.Axis(format="%", gridColor="#e2eef0"))
+    y = alt.Y("share:Q", title="Share of detections",
+              axis=alt.Axis(format="%", gridColor="#e2eef0", tickCount=4))
+    bird = alt.Chart(long[long["series"] == "This bird"]).mark_bar(
+        cornerRadiusTopLeft=3, cornerRadiusTopRight=3, opacity=0.9).encode(
+        x=x, x2=alt.X2("x2:Q"), y=y, y2=alt.datum(0), color=color,
+        tooltip=tip
+    ).transform_calculate(x2="datum.conf + 0.045")
+    everyone = alt.Chart(long[long["series"] == "All birds"]).mark_line(
+        strokeWidth=2, interpolate="step-after", strokeDash=[5, 4]).encode(
+        x=x, y=y, color=color, tooltip=tip)
+    st.altair_chart(alt.layer(bird, everyone).properties(height=200),
+                    width="stretch", key=f"{where}_conf")
+    f = p["filter"]
+    if f is not None:
+        line = (f"The filters keep {int(f['kept']):,} of its {int(f['raw']):,} "
+                f"raw detections ({f['pct_kept']:.0f}%).")
+        if isinstance(f.get("top_removed_by"), str):
+            line += (" Most removals come from "
+                     f"{_test_label(f['top_removed_by']).lower()}.")
+        if isinstance(f.get("override"), str):
+            line += f" An admin override marks it **{f['override']}**."
+        st.caption(line + " The Filter report tab lists every removed detection.")
+
+
+def render_profile(name, filtered, where):
+    """Draw one bird's profile. ``where`` prefixes element keys so the same
+    bird can appear in the Birds tab and the pop-up together."""
+    p = load_profile(_filter_key(), filtered, name)
+    if not p["glance"]:
+        st.info(f"No detections of {name} in this view.")
+        return
+    res = compute_filters(*_filter_key())
+    _profile_header(name, p, res, filtered, where)
+    _profile_tiles(p["glance"])
+    _profile_season(p, where)
+    left, right = st.columns(2)
+    with left:
+        _profile_day(p, where)
+    with right:
+        _profile_dawn(p)
+        _profile_pattern(p)
+    _profile_sound(p, where)
+    left, right = st.columns(2)
+    with left:
+        _profile_company(p)
+    with right:
+        _profile_reliability(p, where)
+
+
+@st.dialog("Bird profile", width="large")
+def _profile_dialog(name):
+    view = current_filters()[1]
+    if name not in set(view["common_name"]):
+        st.info(f"{name} is hidden by the false-positive filters. Choose Raw "
+                "in the sidebar to see its profile.")
+        return
+    render_profile(name, filtered_mode, "dialog")
+    st.caption(f"Share this profile: add ?bird={urllib.parse.quote_plus(name)} "
+               "to the page address, or pick it in the Birds tab.")
+
+
+with birds_tab:
+    st.subheader("Birds")
+    # Drawn only while this tab is open: a profile fetches audio clips for its
+    # spectrograms, which the rest of the page shouldn't wait for.
+    if birds_tab.open:
+        _res, _view = current_filters()
+        _options = bird_profile.species_options(_view)
+        _asked = st.query_params.get("bird")
+        if (filtered_mode and _asked and _asked not in _options
+                and _asked in set(_res.detections["common_name"])):
+            st.info(f"{_asked} is hidden by the false-positive filters. Choose "
+                    "Raw in the sidebar to see its profile, or find it in the "
+                    "Filter report tab.")
+        if not _options:
+            st.info("No birds to show yet.")
+        else:
+            _latest = bird_profile.latest_species(_view)
+            _pick = st.selectbox(
+                "Find a bird", _options, index=_options.index(_latest),
+                key="bird", bind="query-params",
+                placeholder="Type a name",
+                help="Starts on the most recently heard bird. The page address "
+                     "updates as you choose, so a profile can be bookmarked "
+                     "or shared.")
+            render_profile(_pick, filtered_mode, "tab")
+
+
 # --- Filter report -------------------------------------------------------
 
 def _after_admin_write(message):
@@ -1425,3 +1973,8 @@ with report_tab:
     elif config.ADMIN_PASSWORD:
         st.caption("Thresholds and species overrides can be changed by the "
                    "site admin (sign in from the sidebar).")
+
+# A bird clicked in a table or on a feed card opens in a pop-up (once).
+_open_profile = st.session_state.pop("open_profile", None)
+if _open_profile:
+    _profile_dialog(_open_profile)
