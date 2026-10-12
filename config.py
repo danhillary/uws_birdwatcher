@@ -170,8 +170,10 @@ DISPUTED_THRESHOLD = int(os.environ.get("BW_DISPUTED_THRESHOLD", "-3"))
 # them.
 #
 # Seconds between full recomputes of the stored flags, run on a background
-# thread in the listener. 0 disables (run `python -m filter_refresh` by hand).
-FILTER_REFRESH_SECONDS = int(os.environ.get("BW_FILTER_REFRESH", "600"))
+# thread in the listener (a pass takes a few seconds). The phone widget counts a
+# detection only once it has been judged, so this is also the widget's lag.
+# 0 disables (run `python -m filter_refresh` by hand).
+FILTER_REFRESH_SECONDS = int(os.environ.get("BW_FILTER_REFRESH", "120"))
 
 # Passphrase that unlocks the dashboard's admin controls: threshold sliders,
 # saving thresholds, and manual species overrides. Empty = no admin controls

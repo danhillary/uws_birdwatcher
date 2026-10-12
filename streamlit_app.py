@@ -127,8 +127,16 @@ _EMPTY_DETECTIONS = pd.DataFrame({
 })
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_detections():
+@st.cache_data(ttl=5, show_spinner=False)
+def load_data_version():
+    """The newest detection id: a cheap query that every filtered view keys
+    its caches on, so a new detection is loaded and judged within seconds."""
+    return _read(db.latest_detection_id, default=0) or 0
+
+
+@st.cache_data(ttl=3600, max_entries=3, show_spinner=False)
+def load_detections(version):
+    """All detections as of ``version`` (the newest id); see load_data_version."""
     df = _read(db.all_detections, default=None)
     return _EMPTY_DETECTIONS.copy() if df is None or df.empty else df
 
@@ -149,10 +157,11 @@ def load_last_refresh():
     return _read(db.last_filter_refresh, default=None)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def compute_filters(cfg_items, enabled, override_items):
-    """filters.compute on the cached detections, keyed by the filter setting."""
-    return filters.compute(load_detections(), dict(cfg_items), enabled,
+@st.cache_data(ttl=3600, max_entries=20, show_spinner=False)
+def compute_filters(cfg_items, enabled, override_items, version):
+    """filters.compute on the cached detections, keyed by the filter setting
+    and the data version."""
+    return filters.compute(load_detections(version), dict(cfg_items), enabled,
                            dict(override_items))
 
 
@@ -295,7 +304,7 @@ if st.sidebar.button("Refresh now"):
     st.cache_data.clear()
     st.rerun()
 
-_last_at = load_detections()["detected_at"].max()
+_last_at = load_detections(load_data_version())["detected_at"].max()
 if pd.notna(_last_at):
     _last_at = _last_at.to_pydatetime()
     st.sidebar.caption(f"Last detection: {_fmt_date(_last_at)} "
@@ -361,10 +370,10 @@ def enabled_tests():
 
 def _filter_key():
     """The current filter setting as hashable cache-key parts:
-    (thresholds, enabled tests, overrides)."""
+    (thresholds, enabled tests, overrides, data version)."""
     overrides = {r["common_name"]: r["status"] for r in load_overrides()}
     return (tuple(sorted(effective_config().items())), enabled_tests(),
-            tuple(sorted(overrides.items())))
+            tuple(sorted(overrides.items())), load_data_version())
 
 
 def current_filters():
@@ -530,9 +539,11 @@ def _conf_col(label="Confidence"):
 
 # We pull a generous window of recent rows, then collapse back-to-back repeats of
 # the same species into single cards (a resident bird can otherwise fill the whole
-# feed). _FEED_FETCH is how many raw detections we read; _FEED_CARDS caps how many
-# collapsed cards we render (each mounts an audio element and two buttons).
+# feed). _FEED_FETCH is how many raw detections we read (more in Filtered mode,
+# where roughly half are hidden); _FEED_CARDS caps how many collapsed cards we
+# render (each mounts an audio element and two buttons).
 _FEED_FETCH = 150
+_FEED_FETCH_FILTERED = 400
 _FEED_CARDS = 30
 
 
@@ -674,17 +685,36 @@ with feed_tab:
 
     st.caption("Back-to-back repeats of the same species are grouped into one "
                "card (best clip shown). Tap \U0001F44D / \U0001F44E to tell us "
-               "whether a clip matches the bird. The feed shows every "
-               "detection as it arrives; in Filtered mode, cards the "
-               "false-positive filters drop are marked.")
+               "whether a clip matches the bird.")
 
     @st.fragment(run_every=_REFRESH)
     def live_feed():
-        rows = load_recent(_FEED_FETCH)
+        raw_rows = load_recent(_FEED_FETCH_FILTERED if filtered_mode
+                               else _FEED_FETCH)
+        # Judge every row with the same filters as the rest of the page. A row
+        # newer than the cached data has no verdict yet: hidden in Filtered
+        # mode until it is judged (seconds), shown unmarked in Raw.
+        det = current_filters()[0].detections
+        kept = dict(zip(det["id"], det["keep"].astype(bool)))
+        why = dict(zip(det["id"], det["removed_by"]))
+        if filtered_mode:
+            rows = [r for r in raw_rows if kept.get(r["id"], False)]
+            hidden = len(raw_rows) - len(rows)
+            # Always draw this caption: an element that disappears inside a
+            # fragment can linger on screen as a stale copy.
+            st.caption(
+                f"Filtered: {hidden:,} of the latest {len(raw_rows):,} detections "
+                "are hidden as likely false positives. Choose Raw in the "
+                "sidebar to see them, or open the Filter report tab.")
+        else:
+            rows = raw_rows
+            st.caption("Raw: every detection as it arrives. Cards the "
+                       "false-positive filters would hide are marked.")
         if not rows:
             st.info("No detections yet. Start the listener "
                     "(`python -m capture.listen`) and play some birdsong near "
-                    "the mic.")
+                    "the mic." if not raw_rows else
+                    "Nothing recent has passed the filters yet.")
             return
         groups = _group_consecutive(rows)[:_FEED_CARDS]
         ids = [g["rep"].get("id") for g in groups]
@@ -693,11 +723,8 @@ with feed_tab:
         if st.session_state.vote_error:
             st.warning("Voting is unavailable — the dashboard's database user "
                        "is read-only.")
-        removed = {}
-        if filtered_mode:
-            det = current_filters()[0].detections
-            hit = det[det["id"].isin(ids) & ~det["keep"].astype(bool)]
-            removed = dict(zip(hit["id"], hit["removed_by"]))
+        removed = {} if filtered_mode else {
+            i: why.get(i) for i in ids if i in kept and not kept[i]}
         for g in groups:
             did = g["rep"].get("id")
             _detection_card(g, tallies.get(did, {}), mine.get(did, 0),
@@ -1234,7 +1261,8 @@ def _admin_overrides():
                  "Note": r["note"] or "",
                  "Set": _fmt_date(r["updated_at"])} for r in rows]),
                 hide_index=True, width="stretch")
-        names = sorted(load_detections()["common_name"].dropna().unique())
+        names = sorted(load_detections(load_data_version())["common_name"]
+                       .dropna().unique())
         with st.form("override_form", clear_on_submit=True):
             name = st.selectbox("Species", names)
             verdict = st.radio("Verdict", ["confirmed", "rejected",

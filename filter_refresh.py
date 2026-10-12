@@ -7,8 +7,9 @@ The compute takes a fraction of a second, so a full pass is simpler and safer
 than tracking which bouts, species and days a new detection could change.
 
 The listener runs this on a background thread every ``BW_FILTER_REFRESH``
-seconds (default 600). The dashboard runs it after an admin saves thresholds
-or overrides. Detections newer than the last refresh count as kept until then.
+seconds (default 120). The dashboard runs it after an admin saves thresholds
+or overrides. Filtered SQL views (the phone widget) leave out detections newer
+than the last refresh until it has judged them.
 
 Command line:
 
