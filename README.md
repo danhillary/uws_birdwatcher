@@ -132,8 +132,10 @@ Streamlit opens **http://localhost:8501** automatically. Five tabs:
 - **Filter report** — what the false-positive filters keep and remove, per
   species, with every removed detection listed for checking
 
-A **Filtered / Raw** switch in the sidebar applies to every view (Filtered is the
-default); see *False-positive filters* below.
+A **Filtered / Raw** switch in the sidebar applies to every view, the live feed
+and the phone widget included (Filtered is the default). In Filtered mode likely
+false positives are hidden everywhere; they are listed only in the Filter report
+tab and in Raw mode. See *False-positive filters* below.
 
 Below the summary cards a **listener health** pill shows whether the recording
 machine is alive: 🟢 listening (with the live mic level), 🟡 running but the mic
@@ -197,13 +199,15 @@ How it fits together:
 - `filters.py` holds the rules as pure pandas code (no database), so they are
   unit-tested (`python -m pytest tests`) and fast (well under a second).
 - The dashboard runs them in-process, so the Filtered/Raw switch, the per-test
-  switches and the admin threshold sliders respond instantly. The live feed
-  stays raw (new detections are too fresh to judge) and marks cards the filters
-  would drop.
+  switches and the admin threshold sliders respond instantly. Its caches key on
+  the newest detection id, so a new detection is judged within seconds. In
+  Filtered mode the live feed hides what the filters drop; Raw shows every card
+  and marks the ones the filters would hide.
 - The listener recomputes and stores every flag on a background thread every
-  `BW_FILTER_REFRESH` seconds (default 600), in `detection_flags` and
-  `species_quality`. The phone widget's totals read these; new detections count
-  as kept until the next refresh.
+  `BW_FILTER_REFRESH` seconds (default 120), in `detection_flags` and
+  `species_quality`. The phone widget reads these: its latest bird, totals and
+  new species are all filtered, and a new detection appears there once it has
+  been judged.
 - Thresholds live in the `filter_config` table (seeded with the defaults) and
   overrides in `species_override`.
 - Setting `BW_ADMIN_PASSWORD` unlocks admin controls on the Filter report tab:
@@ -366,7 +370,7 @@ variables:
 | `BW_FILTER_HUMAN_VOICE` | `1`            | Keep clips with a human voice off the public bucket |
 | `BW_HUMAN_VOICE_CONF` | `0.3`            | Confidence at which a human voice triggers the hold |
 | `BW_DISPUTED_THRESHOLD` | `-3`           | Net clip-vote score at/below which a detection is flagged "Disputed" |
-| `BW_FILTER_REFRESH` | `600`              | Seconds between the listener's recomputes of the stored false-positive flags (`0` = off) |
+| `BW_FILTER_REFRESH` | `120`              | Seconds between the listener's recomputes of the stored false-positive flags (`0` = off) |
 | `BW_ADMIN_PASSWORD` | *(empty)*          | Passphrase for the dashboard's filter admin controls; empty = no admin controls |
 
 Example (PowerShell): `$env:BW_INPUT_DEVICE="UAC"; .venv\Scripts\python -m capture.listen`

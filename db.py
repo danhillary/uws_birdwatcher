@@ -245,11 +245,18 @@ def _rows(result):
     return [dict(r) for r in result.mappings().all()]
 
 
-def recent_detections(conn, limit=50):
+def recent_detections(conn, limit=50, filtered=False):
+    src, keep = _source(filtered)
     return _rows(conn.execute(
-        text(f"SELECT * FROM {_TABLE} ORDER BY detected_at DESC, id DESC LIMIT :limit"),
+        text(f"""SELECT d.* FROM {src} WHERE {keep}
+                 ORDER BY d.detected_at DESC, d.id DESC LIMIT :limit"""),
         {"limit": limit},
     ))
+
+
+def latest_detection_id(conn):
+    """The newest detection id (0 when empty): a cheap data-version stamp."""
+    return conn.execute(text(f"SELECT COALESCE(MAX(id), 0) FROM {_TABLE}")).scalar()
 
 
 def _source(filtered):
@@ -257,7 +264,9 @@ def _source(filtered):
 
     Filtered keeps the rows the stored flags keep and applies manual species
     overrides immediately. Detections newer than the last flag refresh have no
-    flags yet and count as kept until the next refresh judges them."""
+    verdict yet and are left out until the next refresh judges them, so a
+    filtered view never shows an unjudged likely false positive (a confirmed
+    species shows straight away)."""
     if not filtered:
         return f"{_TABLE} d", "TRUE"
     return (f"""{_TABLE} d
@@ -265,7 +274,7 @@ def _source(filtered):
                 LEFT JOIN {_OVERRIDE} o ON o.common_name = d.common_name""",
             """(o.status = 'confirmed'
                 OR (o.status IS DISTINCT FROM 'rejected'
-                    AND COALESCE(f.keep, TRUE)))""")
+                    AND f.keep IS TRUE))""")
 
 
 def counts_for_day(conn, day, filtered=False):
