@@ -118,11 +118,21 @@ terminal** (leave the listener running in the first), start it:
 # macOS:    .venv/bin/streamlit run streamlit_app.py
 ```
 
-Streamlit opens **http://localhost:8501** automatically. Five tabs:
+Streamlit opens **http://localhost:8501** automatically. Six tabs:
 
 - **Live feed** — most recent detections, auto-refreshing, with playable clips
 - **Daily stats** — per-species counts and an activity-by-hour chart (pick a day)
 - **Life list** — every species ever heard, first/last heard, totals
+- **Birds** — a profile for any bird (type to search; the page address updates,
+  e.g. `?bird=Blue+Jay`, so a profile can be bookmarked or shared, and the phone
+  widget opens on the latest bird's). It shows a Wikipedia summary, a status
+  (resident, arrived, departed, passing through, rare visitor), what sets it
+  apart from the other birds, its season, its day against the average bird,
+  when it starts at dawn, how it calls (bouts and gaps), spectrograms of its
+  best clips with a pitch signature against all birds, the birds it is heard
+  with more often than chance, and how reliably the model recognises it.
+  Clicking a bird in the Life list or Daily stats tables, or **Profile** on a
+  live-feed card, opens the same profile in a pop-up.
 - **Insights** — seasonal and daily patterns: which species are here in which
   weeks (fall migrants arriving), species per week, how the first call of the
   day tracks sunrise, which species sing first at dawn, and each common
@@ -387,6 +397,8 @@ db.py                  # PostgreSQL storage + queries (SQLAlchemy)
 filters.py             # false-positive filter rules (pure pandas, no DB)
 filter_refresh.py      # recompute + store filter flags; --validate replays the trial
 insights.py            # Insights-tab analytics + sunrise/sunset (pure pandas, no DB)
+bird_profile.py        # per-bird profile analytics (pure pandas, no DB)
+acoustics.py           # clip spectrograms + pitch signatures (numpy only)
 storage.py             # clip saving + storage-cap pruning
 feed.py                # publishes the iPhone-widget JSON feed to S3 (optional)
 clips_s3.py            # uploads detection clips to S3 for cloud playback (optional)
@@ -402,6 +414,7 @@ requirements-dev.txt   # test tools (pytest)
 tests/
   test_filters.py      # unit tests for each filter rule
   test_insights.py     # unit tests for the analytics and sun times
+  test_bird_profile.py # unit tests for bird profiles and clip acoustics
 .env.example           # template for DB credentials (copy to .env)
 ```
 
@@ -431,3 +444,6 @@ tests/
   the phone widget; validated against the Oct 2026 trial run ✅.
 - **Phase 8 (done)** — Insights tab: seasonal presence grid, species per week,
   dawn chorus vs sunrise, dawn singing order, and daily rhythm ✅.
+- **Phase 9 (done)** — bird profiles: searchable, shareable per-bird pages and
+  pop-ups with seasonal, daily, dawn and calling-pattern stats against the
+  average bird, plus spectrograms and pitch signatures from the stored clips ✅.

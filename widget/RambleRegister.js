@@ -42,11 +42,14 @@ const DOT = {
 // lives and renders best — we swap the scheme to x-safari-https://, which forces
 // Safari regardless of the default browser. (Custom schemes like shortcuts:// are
 // passed through untouched so you can still point DASHBOARD_URL at a Shortcut.)
-function linkToDashboard(w) {
+function linkToDashboard(w, bird) {
   if (!DASHBOARD_URL) return;
-  w.url = DASHBOARD_URL.startsWith("https://")
-    ? "x-safari-" + DASHBOARD_URL
+  // With a bird, open straight on its profile (the dashboard's Birds tab).
+  const target = bird && DASHBOARD_URL.startsWith("http")
+    ? DASHBOARD_URL + (DASHBOARD_URL.includes("?") ? "&" : "?")
+      + "bird=" + encodeURIComponent(bird)
     : DASHBOARD_URL;
+  w.url = target.startsWith("https://") ? "x-safari-" + target : target;
 }
 
 async function loadFeed() {
@@ -151,8 +154,8 @@ async function buildWidget() {
   footer.font = Font.mediumSystemFont(11);
   footer.textColor = new Color("#a8c7bb");
 
-  // Tapping the widget opens the dashboard.
-  linkToDashboard(w);
+  // Tapping the widget opens the latest bird's profile on the dashboard.
+  linkToDashboard(w, latest && latest.name);
 
   // Ask iOS to refresh in ~10 minutes (best-effort; the OS has final say).
   w.refreshAfterDate = new Date(Date.now() + 10 * 60 * 1000);
