@@ -1,5 +1,5 @@
-"""Birdwatcher dashboard (Streamlit) — live feed, daily stats, life list, and
-the false-positive filter report.
+"""Birdwatcher dashboard (Streamlit) — live feed, daily stats, life list,
+seasonal and daily insights, and the false-positive filter report.
 
 Reads the shared PostgreSQL database written by the microphone listener, so it
 works both locally and when hosted on Posit Connect Cloud (Streamlit framework,
@@ -27,6 +27,7 @@ import uuid
 # on sys.path the way a local `streamlit run` does.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 from sqlalchemy.exc import SQLAlchemyError
@@ -35,6 +36,7 @@ import config
 import db
 import filter_refresh
 import filters
+import insights
 
 st.set_page_config(
     page_title="The Ramble Register",
@@ -357,14 +359,20 @@ def enabled_tests():
                  if st.session_state.get(f"test_{t}", True))
 
 
+def _filter_key():
+    """The current filter setting as hashable cache-key parts:
+    (thresholds, enabled tests, overrides)."""
+    overrides = {r["common_name"]: r["status"] for r in load_overrides()}
+    return (tuple(sorted(effective_config().items())), enabled_tests(),
+            tuple(sorted(overrides.items())))
+
+
 def current_filters():
     """(filters.Result for the current settings, the rows to display).
 
     The rows are the kept detections in Filtered mode and all of them in Raw.
     """
-    overrides = {r["common_name"]: r["status"] for r in load_overrides()}
-    res = compute_filters(tuple(sorted(effective_config().items())),
-                          enabled_tests(), tuple(sorted(overrides.items())))
+    res = compute_filters(*_filter_key())
     det = res.detections
     view = det[det["keep"].astype(bool)] if filtered_mode else det
     return res, view
@@ -658,8 +666,8 @@ def _detection_card(group, tally, mine, removed_by=None):
 
 # --- Tabs ----------------------------------------------------------------
 
-feed_tab, stats_tab, life_tab, report_tab = st.tabs(
-    ["Live feed", "Daily stats", "Life list", "Filter report"])
+feed_tab, stats_tab, life_tab, insights_tab, report_tab = st.tabs(
+    ["Live feed", "Daily stats", "Life list", "Insights", "Filter report"])
 
 with feed_tab:
     st.subheader("Live feed")
@@ -815,6 +823,343 @@ with life_tab:
                     hide_index=True, width="stretch",
                     column_config=_conf_col("Best"),
                 )
+
+
+# --- Insights ------------------------------------------------------------
+# Seasonal and daily patterns, computed by insights.py from the same rows the
+# rest of the page shows (filtered or raw). Charts use the dashboard palette:
+# meadow green for data, a muted sage for reference marks (sunrise), and one
+# light-to-dark green ramp for every heatmap. Each chart has a hover tooltip and
+# a data table underneath.
+
+_MUTED = "#5a7d72"
+_GREEN = "#4c9a6a"
+_SURFACE = "#fbfdfe"
+_OFFLINE = "#e6ecee"
+_RAMP = ["#e3f1e8", "#b5dbc2", "#7fbd96", "#4c9a6a", "#2f7350", "#1d4e36"]
+_WHISKER = "#b5dbc2"
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_insights(key, filtered, min_days):
+    res = compute_filters(*key)
+    det = res.detections
+    view = det[det["keep"].astype(bool)] if filtered else det
+    lat, lon, tz = config.LATITUDE, config.LONGITUDE, config.TIMEZONE
+    chorus = insights.dawn_chorus(view, lat, lon, tz)
+    # A continuous sunrise line over the whole season, not just listening days.
+    sun = pd.DataFrame(columns=["day", "sunrise_h"])
+    if len(det):
+        days = pd.date_range(det["detected_at"].min().normalize(),
+                             det["detected_at"].max().normalize(), freq="D")
+        rises = pd.to_datetime([insights.sun_times(d.date(), lat, lon, tz)[0]
+                                for d in days])
+        sun = pd.DataFrame({"day": days,
+                            "sunrise_h": rises.hour + rises.minute / 60})
+    return {
+        "headline": insights.headline(view, det),
+        "weekly": insights.weekly_richness(view, det),
+        "grid": insights.presence_grid(view, det, min_days=min_days),
+        "chorus": chorus,
+        "by_month": insights.dawn_by_month(chorus),
+        "order": insights.dawn_order(view, lat, lon, tz),
+        "rhythm": insights.daily_rhythm(view),
+        "sun": sun,
+    }
+
+
+def _fmt_day(d):
+    """'Sep 7' — month and day without zero padding (portable strftime)."""
+    return f"{d:%b} {d.day}"
+
+
+def _week_label(weeks):
+    weeks = pd.to_datetime(pd.Series(weeks))
+    return weeks.dt.strftime("%b ") + weeks.dt.day.astype(str)
+
+
+def _rel_sunrise(minutes):
+    m = int(round(minutes))
+    if m == 0:
+        return "at sunrise"
+    return f"{abs(m)} min {'before' if m < 0 else 'after'} sunrise"
+
+
+_HOUR_LABEL = "datum.value + ':00'"
+
+
+def _insights_presence(data):
+    g = data["grid"].copy()
+    if g.empty:
+        st.info("Not enough detections yet.")
+        return
+    g["week_label"] = _week_label(g["week"]).values
+    weeks = list(dict.fromkeys(g.sort_values("week")["week_label"]))
+    species = list(g.sort_values("order")["common_name"].drop_duplicates())
+    g["heard"] = [
+        "Listener offline" if l == 0 else f"{h} of {l} days listened"
+        for h, l in zip(g["days_heard"], g["days_listened"])]
+    x = alt.X("week_label:O", title=None, scale=alt.Scale(domain=weeks),
+              axis=alt.Axis(labelAngle=-45, ticks=False, domain=False))
+    y = alt.Y("common_name:N", title=None, scale=alt.Scale(domain=species),
+              axis=alt.Axis(ticks=False, domain=False, labelOverlap=False,
+                            labelLimit=220))
+    tip = [alt.Tooltip("common_name:N", title="Species"),
+           alt.Tooltip("week_label:N", title="Week of"),
+           alt.Tooltip("heard:N", title="Heard on")]
+    offline = alt.Chart(g[g["days_listened"] == 0]).mark_rect(
+        color=_OFFLINE, stroke=_SURFACE, strokeWidth=2).encode(x=x, y=y, tooltip=tip)
+    heard = alt.Chart(g[g["days_heard"] > 0]).mark_rect(
+        stroke=_SURFACE, strokeWidth=2, cornerRadius=2).encode(
+        x=x, y=y, tooltip=tip,
+        color=alt.Color("share:Q", title="Share of days heard",
+                        scale=alt.Scale(domain=[0, 1], range=_RAMP),
+                        legend=alt.Legend(format="%", orient="top",
+                                          gradientLength=160)))
+    st.altair_chart(alt.layer(offline, heard).properties(
+        height=alt.Step(22)), width="stretch")
+
+
+def _insights_weekly(data):
+    w = data["weekly"].copy()
+    if w.empty:
+        return
+    w["week_label"] = _week_label(w["week"]).values
+    weeks = list(w["week_label"])
+    top = max(int(w["species"].max()), 1)
+    w["bar"] = w["species"]
+    w["label_y"] = top * 0.02
+    w["note"] = ["Listener offline" if l == 0 else f"{l} of 7 days"
+                 for l in w["days_listened"]]
+    x = alt.X("week_label:O", title=None, scale=alt.Scale(domain=weeks),
+              axis=alt.Axis(labelAngle=-45, ticks=False))
+    y = alt.Y("bar:Q", title="Species heard",
+              axis=alt.Axis(tickMinStep=5, gridColor="#e2eef0"))
+    tip = [alt.Tooltip("week_label:N", title="Week of"),
+           alt.Tooltip("species:Q", title="Species"),
+           alt.Tooltip("detections:Q", title="Detections", format=","),
+           alt.Tooltip("note:N", title="Listening")]
+    bars = alt.Chart(w[w["days_listened"] > 0]).mark_bar(
+        color=_GREEN, cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
+        x=x, y=y, tooltip=tip)
+    off = alt.Chart(w[w["days_listened"] == 0]).mark_text(
+        text="offline", angle=270, align="left", baseline="middle",
+        color=_MUTED, fontSize=11).encode(
+        x=x, y=alt.Y("label_y:Q"),
+        tooltip=[alt.Tooltip("week_label:N", title="Week of"),
+                 alt.Tooltip("note:N", title="Listening")])
+    st.altair_chart(alt.layer(bars, off).properties(height=260), width="stretch")
+
+
+def _insights_dawn(data):
+    ch, sun = data["chorus"].copy(), data["sun"]
+    if ch.empty:
+        st.info("No dawn detections yet.")
+        return
+    ch["time"] = ch["first_call"].dt.strftime("%H:%M")
+    ch["sunrise_t"] = ch["sunrise"].dt.strftime("%H:%M")
+    ch["relative"] = [_rel_sunrise(m) for m in ch["min_from_sunrise"]]
+    lo = int(min(ch["first_call_h"].min(), sun["sunrise_h"].min()))
+    hi = int(max(ch["first_call_h"].max(), sun["sunrise_h"].max())) + 1
+    # Both layers carry a "series" column so they share one legend.
+    color = alt.Color("series:N", title=None,
+                      scale=alt.Scale(domain=["First call of the day", "Sunrise"],
+                                      range=[_GREEN, _MUTED]),
+                      legend=alt.Legend(orient="top"))
+    ch["series"] = "First call of the day"
+    sun = sun.assign(series="Sunrise")
+    x = alt.X("day:T", title=None, axis=alt.Axis(format="%b %d", gridColor="#e2eef0"))
+    line = alt.Chart(sun).mark_line(strokeWidth=2).encode(
+        x=x, y=alt.Y("sunrise_h:Q", scale=alt.Scale(domain=[lo, hi], zero=False)),
+        color=color)
+    dots = alt.Chart(ch).mark_circle(size=64, opacity=1, stroke=_SURFACE,
+                                     strokeWidth=2).encode(
+        x=x,
+        y=alt.Y("first_call_h:Q", title="Time of day",
+                scale=alt.Scale(domain=[lo, hi], zero=False),
+                axis=alt.Axis(values=list(range(lo, hi + 1)),
+                              labelExpr=_HOUR_LABEL, gridColor="#e2eef0")),
+        color=color,
+        tooltip=[alt.Tooltip("day:T", title="Date", format="%b %d"),
+                 alt.Tooltip("time:N", title="First call"),
+                 alt.Tooltip("species:N", title="Species"),
+                 alt.Tooltip("sunrise_t:N", title="Sunrise"),
+                 alt.Tooltip("relative:N", title="Relative")])
+    st.altair_chart(alt.layer(line, dots).properties(height=300), width="stretch")
+
+
+def _insights_order(data):
+    o = data["order"].copy()
+    if o.empty:
+        st.info("Not enough dawn detections yet.")
+        return
+    o["relative"] = [_rel_sunrise(m) for m in o["median_min"]]
+    species = list(o["common_name"])
+    y = alt.Y("common_name:N", title=None, scale=alt.Scale(domain=species),
+              axis=alt.Axis(ticks=False, domain=False, labelOverlap=False,
+                            labelLimit=220))
+    xs = alt.Scale(domain=[min(-30, o["q1_min"].min() - 10), o["q3_min"].max() + 10])
+    tip = [alt.Tooltip("common_name:N", title="Species"),
+           alt.Tooltip("relative:N", title="Usually starts"),
+           alt.Tooltip("days:Q", title="Days")]
+    spread = alt.Chart(o).mark_rule(color=_WHISKER, strokeWidth=6,
+                                    strokeCap="round").encode(
+        x=alt.X("q1_min:Q", scale=xs), x2="q3_min:Q", y=y, tooltip=tip)
+    dots = alt.Chart(o).mark_circle(size=90, color=_GREEN, opacity=1,
+                                    stroke=_SURFACE, strokeWidth=2).encode(
+        x=alt.X("median_min:Q", scale=xs,
+                title="Minutes after sunrise of the first call of the day",
+                axis=alt.Axis(gridColor="#e2eef0")),
+        y=y, tooltip=tip)
+    zero = pd.DataFrame({"x": [0], "label": ["Sunrise"]})
+    rule = alt.Chart(zero).mark_rule(color=_MUTED, strokeDash=[4, 4]).encode(
+        x=alt.X("x:Q", scale=xs))
+    label = alt.Chart(zero).mark_text(color=_MUTED, align="left", dx=4, dy=-4,
+                                      baseline="bottom", fontSize=11).encode(
+        x=alt.X("x:Q", scale=xs), y=alt.value(0), text="label:N")
+    st.altair_chart(alt.layer(spread, rule, dots, label).properties(
+        height=alt.Step(26)), width="stretch")
+
+
+def _insights_rhythm(data):
+    r = data["rhythm"].copy()
+    if r.empty:
+        return
+    species = list(r.sort_values("rank")["common_name"].drop_duplicates())
+    r["hours"] = [f"{h:02d}:00–{(h + 1) % 24:02d}:00" for h in r["hour"]]
+    st.altair_chart(alt.Chart(r).mark_rect(
+        stroke=_SURFACE, strokeWidth=2, cornerRadius=2).encode(
+        x=alt.X("hour:O", title="Hour of day",
+                axis=alt.Axis(values=list(range(0, 24, 3)), labelExpr=_HOUR_LABEL,
+                              labelAngle=0, ticks=False, domain=False)),
+        y=alt.Y("common_name:N", title=None, scale=alt.Scale(domain=species),
+                axis=alt.Axis(ticks=False, domain=False, labelOverlap=False,
+                              labelLimit=220)),
+        color=alt.Color("share:Q", title="Share of its detections",
+                        scale=alt.Scale(domain=[0, float(r["share"].max() or 1)],
+                                        range=_RAMP),
+                        legend=alt.Legend(format="%", orient="top",
+                                          gradientLength=160)),
+        tooltip=[alt.Tooltip("common_name:N", title="Species"),
+                 alt.Tooltip("hours:N", title="Hour"),
+                 alt.Tooltip("detections:Q", title="Detections", format=","),
+                 alt.Tooltip("share:Q", title="Share", format=".0%")],
+    ).properties(height=alt.Step(26)), width="stretch")
+
+
+with insights_tab:
+    st.subheader("Insights")
+    st.caption("Seasonal and daily patterns in what the window hears. "
+               + ("Built from the filtered detections; choose Raw in the "
+                  "sidebar to include likely false positives."
+                  if filtered_mode else
+                  "Built from every raw detection, likely false positives "
+                  "included; choose Filtered in the sidebar for the cleaner "
+                  "picture."))
+    min_days = st.session_state.get("ins_min_days", 3)
+    data = load_insights(_filter_key(), filtered_mode, min_days)
+    h = data["headline"]
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Days listened", h["days_listened"],
+              help="Days the listener recorded anything. It was offline from "
+                   "late June to mid July and in late September.")
+    k2.metric("Species", h["species"])
+    k3.metric("Most species in a week", h["peak_week_species"],
+              help=(f"Week of {_fmt_day(h['peak_week'])}"
+                    if h["peak_week"] else None))
+    if h["newest"]:
+        st.markdown(f"Newest arrival: **{h['newest']}**, first heard "
+                    f"{_fmt_day(h['newest_date'])}.")
+
+    st.markdown("#### Who's here when")
+    st.caption("Each row is a species, in the order it was first heard; each "
+               "column is a week. Darker means heard on more of the days the "
+               "listener ran that week. Gray weeks are when the listener was "
+               "offline. Rows that only light up from mid August on are fall "
+               "migrants passing through.")
+    st.select_slider(
+        "Show species heard on at least",
+        options=[1, 2, 3, 5, 10, 20], value=3, key="ins_min_days",
+        format_func=lambda n: f"{n} day{'' if n == 1 else 's'}")
+    _insights_presence(data)
+    with st.expander("Data: weeks heard per species"):
+        g = data["grid"]
+        if len(g):
+            st.dataframe(
+                g[g["days_heard"] > 0].assign(week=lambda d: d["week"].dt.date)
+                [["common_name", "week", "days_heard", "days_listened"]]
+                .rename(columns={"common_name": "Species", "week": "Week of",
+                                 "days_heard": "Days heard",
+                                 "days_listened": "Days listened"}),
+                hide_index=True, width="stretch")
+
+    st.markdown("#### Species per week")
+    wk = data["weekly"]
+    if h["peak_week"]:
+        st.caption(f"The richest week was the week of {_fmt_day(h['peak_week'])}, "
+                   f"with {h['peak_week_species']} species. Weeks marked "
+                   "offline had no listening; hover a bar for how many days "
+                   "the listener ran that week.")
+    _insights_weekly(data)
+    with st.expander("Data: species per week"):
+        if len(wk):
+            st.dataframe(wk.assign(week=wk["week"].dt.date).rename(columns={
+                "week": "Week of", "species": "Species",
+                "detections": "Detections", "days_listened": "Days listened"}),
+                hide_index=True, width="stretch")
+
+    st.markdown("#### The dawn chorus follows the sun")
+    bm = data["by_month"]
+    if len(bm):
+        parts = [f"{m:%B}: {_rel_sunrise(v)}"
+                 for m, v in zip(bm["month"], bm["median_min"])]
+        st.caption("Each dot is the first call of a day (between 90 minutes "
+                   "before and 4 hours after sunrise, which leaves out night "
+                   "migrants passing over); the line is sunrise. Typical first "
+                   "call by month: " + "; ".join(parts) + ".")
+    _insights_dawn(data)
+    with st.expander("Data: first call each day"):
+        ch = data["chorus"]
+        if len(ch):
+            st.dataframe(pd.DataFrame({
+                "Date": ch["day"].dt.date,
+                "First call": ch["first_call"].dt.strftime("%H:%M"),
+                "Species": ch["species"],
+                "Sunrise": ch["sunrise"].dt.strftime("%H:%M"),
+                "Minutes from sunrise": ch["min_from_sunrise"].astype(int),
+            }), hide_index=True, width="stretch")
+
+    st.markdown("#### Who sings first")
+    od = data["order"]
+    if len(od):
+        lead = od.iloc[0]
+        st.caption(f"When each species makes its first call of the day, "
+                   f"relative to sunrise (species heard at dawn on 5 or more "
+                   f"days). {lead['common_name']} usually starts first, "
+                   f"{_rel_sunrise(lead['median_min'])}. The dot is the "
+                   "typical day; the bar spans the middle half of days.")
+    _insights_order(data)
+    with st.expander("Data: dawn order"):
+        st.dataframe(od.rename(columns={
+            "common_name": "Species", "median_min": "Median minutes after sunrise",
+            "days": "Days", "q1_min": "Early days (25th pct)",
+            "q3_min": "Late days (75th pct)"}), hide_index=True, width="stretch")
+
+    st.markdown("#### Daily rhythm")
+    st.caption("When each of the most-heard species calls, as a share of its "
+               "own detections, so a quiet species' pattern is as clear as a "
+               "loud one's. Hours are local time.")
+    _insights_rhythm(data)
+    with st.expander("Data: detections by hour"):
+        rh = data["rhythm"]
+        if len(rh):
+            st.dataframe(rh.pivot(index="common_name", columns="hour",
+                                  values="detections")
+                         .reindex(list(rh.sort_values("rank")["common_name"]
+                                       .drop_duplicates()))
+                         .rename_axis(index="Species", columns="Hour"),
+                         width="stretch")
 
 
 # --- Filter report -------------------------------------------------------
