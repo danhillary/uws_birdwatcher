@@ -12,10 +12,17 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # host). Looks for .env next to this file regardless of current directory.
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-# Location — used by BirdNET to filter to species likely near you.
-# Default: Upper West Side, Manhattan.
-LATITUDE = float(os.environ.get("BW_LAT", "40.785"))
-LONGITUDE = float(os.environ.get("BW_LON", "-73.975"))
+# Location — used by BirdNET to filter to species likely near you, for sunrise
+# times, and for the dashboard's map. It is deliberately approximate: the
+# dashboard is public, so this is a point a few blocks from the window (far more
+# precise than BirdNET or sunrise need), never the street address. Keep any
+# exact location out of this file and the repo.
+# Default: Upper West Side, Manhattan (approximate).
+LATITUDE = float(os.environ.get("BW_LAT", "40.7760"))
+LONGITUDE = float(os.environ.get("BW_LON", "-73.9770"))
+# Radius, in metres, of the shaded area the dashboard's map draws around that
+# point, so it reads as "somewhere around here" rather than a pin.
+MAP_RADIUS_M = int(os.environ.get("BW_MAP_RADIUS", "450"))
 
 # Minimum confidence (0-1) for a detection to be reported.
 MIN_CONFIDENCE = float(os.environ.get("BW_MIN_CONF", "0.25"))

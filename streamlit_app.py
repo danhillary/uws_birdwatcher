@@ -297,7 +297,7 @@ def _clip_src(r):
 # --- Sidebar -------------------------------------------------------------
 
 st.sidebar.title("\U0001F426 The Ramble Register")
-st.sidebar.caption(f"Upper West Side, NYC · {config.LATITUDE}, {config.LONGITUDE}")
+st.sidebar.caption("Upper West Side, NYC")
 live = st.sidebar.checkbox("Live updates (10s)", value=True, key="live")
 show_photos = st.sidebar.checkbox("Show bird photos", value=True, key="photos")
 if st.sidebar.button("Refresh now"):
@@ -397,10 +397,11 @@ def _test_label(key):
 with st.sidebar.expander("\U0001F4CD The listening post", expanded=False):
     st.map(
         pd.DataFrame({"lat": [config.LATITUDE], "lon": [config.LONGITUDE]}),
-        zoom=12, size=60, color="#4c9a6a",
+        zoom=13, size=config.MAP_RADIUS_M, color="#4c9a6a55",
     )
     st.caption("A window over the Upper West Side — Central Park's Ramble to the "
-               "east, Riverside Park to the west.")
+               "east, Riverside Park to the west. The shaded area is approximate; "
+               "the exact spot isn't shown.")
 
 _REFRESH = 10 if live else None
 

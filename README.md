@@ -345,8 +345,9 @@ variables:
 | Variable            | Default            | Meaning                                        |
 |---------------------|--------------------|------------------------------------------------|
 | `BW_INPUT_DEVICE`   | `UAC`              | Mic name substring (e.g. `MacBook`) or index   |
-| `BW_LAT`            | `40.785`           | Latitude (default: Upper West Side, NYC)       |
-| `BW_LON`            | `-73.975`          | Longitude                                      |
+| `BW_LAT`            | `40.7760`          | Latitude (default: Upper West Side, NYC; approximate on purpose, as the dashboard shows it publicly) |
+| `BW_LON`            | `-73.9770`         | Longitude                                      |
+| `BW_MAP_RADIUS`     | `450`              | Radius in metres of the dashboard map's shaded "approximately here" area |
 | `BW_MIN_CONF`       | `0.25`             | Minimum confidence (0–1) to report a detection |
 | `BW_SEGMENT_SECONDS`| `15`               | Length of each recorded segment                |
 | `BW_SAMPLE_RATE`    | `48000`            | Sample rate (BirdNET expects 48 kHz)           |
