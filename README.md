@@ -118,11 +118,17 @@ terminal** (leave the listener running in the first), start it:
 # macOS:    .venv/bin/streamlit run streamlit_app.py
 ```
 
-Streamlit opens **http://localhost:8501** automatically. Four tabs:
+Streamlit opens **http://localhost:8501** automatically. Five tabs:
 
 - **Live feed** — most recent detections, auto-refreshing, with playable clips
 - **Daily stats** — per-species counts and an activity-by-hour chart (pick a day)
 - **Life list** — every species ever heard, first/last heard, totals
+- **Insights** — seasonal and daily patterns: which species are here in which
+  weeks (fall migrants arriving), species per week, how the first call of the
+  day tracks sunrise, which species sing first at dawn, and each common
+  species' daily rhythm. Every chart has hover details and a data table, and
+  follows the Filtered/Raw switch. Sunrise is computed locally (NOAA's
+  algorithm), so no extra service or package is needed.
 - **Filter report** — what the false-positive filters keep and remove, per
   species, with every removed detection listed for checking
 
@@ -376,6 +382,7 @@ analysis.py            # reusable BirdNET wrapper
 db.py                  # PostgreSQL storage + queries (SQLAlchemy)
 filters.py             # false-positive filter rules (pure pandas, no DB)
 filter_refresh.py      # recompute + store filter flags; --validate replays the trial
+insights.py            # Insights-tab analytics + sunrise/sunset (pure pandas, no DB)
 storage.py             # clip saving + storage-cap pruning
 feed.py                # publishes the iPhone-widget JSON feed to S3 (optional)
 clips_s3.py            # uploads detection clips to S3 for cloud playback (optional)
@@ -390,6 +397,7 @@ requirements-listen.txt# adds the BirdNET + microphone stack (home machine only)
 requirements-dev.txt   # test tools (pytest)
 tests/
   test_filters.py      # unit tests for each filter rule
+  test_insights.py     # unit tests for the analytics and sun times
 .env.example           # template for DB credentials (copy to .env)
 ```
 
@@ -417,3 +425,5 @@ tests/
   every view; a Filter report tab with per-species summary and removed
   detections; admin threshold sliders and species overrides; stored flags for
   the phone widget; validated against the Oct 2026 trial run ✅.
+- **Phase 8 (done)** — Insights tab: seasonal presence grid, species per week,
+  dawn chorus vs sunrise, dawn singing order, and daily rhythm ✅.
