@@ -186,3 +186,44 @@ FILTER_REFRESH_SECONDS = int(os.environ.get("BW_FILTER_REFRESH", "120"))
 # saving thresholds, and manual species overrides. Empty = no admin controls
 # (the public toggles still work).
 ADMIN_PASSWORD = os.environ.get("BW_ADMIN_PASSWORD", "")
+
+# --- Self-recovery and alerts --------------------------------------------
+
+# The listener recovers on its own from the usual faults (network/database
+# drops, a mic that goes silent or errors, a hung recording), and the watchdog
+# (capture/watchdog.py) restarts it if it crashes or stops making progress.
+# You're only alerted when that recovery fails.
+#
+# Detections the database can't take right now wait in this local outbox (one
+# JSON line each) and are replayed once it's reachable again.
+OUTBOX_PATH = os.environ.get("BW_OUTBOX_PATH") or os.path.join(BASE_DIR, "outbox.jsonl")
+# After a database error, skip the database for this many seconds (detections
+# go to the outbox meanwhile), so a dead connection doesn't add a connect
+# timeout to every segment.
+DB_RETRY_SECONDS = int(os.environ.get("BW_DB_RETRY", "60"))
+
+# Consecutive silent or failed segments before the listener restarts PortAudio
+# and looks for the mic again (4 x 15 s = one minute).
+MIC_REOPEN_AFTER = int(os.environ.get("BW_MIC_REOPEN_AFTER", "4"))
+# Seconds the mic may stay silent or broken, despite reopening, before the
+# listener exits so the watchdog can start a fresh process.
+MIC_GIVE_UP_SECONDS = int(os.environ.get("BW_MIC_GIVE_UP", "600"))
+
+# The listener touches this file every segment; the watchdog kills and restarts
+# it if the file goes stale for HANG_SECONDS (a recording or network call that
+# never returns).
+HEARTBEAT_PATH = os.path.join(BASE_DIR, "listener.heartbeat")
+HANG_SECONDS = int(os.environ.get("BW_HANG_SECONDS", "180"))
+# The watchdog sends a failure alert once the listener has had this many
+# crashes or forced restarts within ALERT_WINDOW seconds.
+ALERT_AFTER_RESTARTS = int(os.environ.get("BW_ALERT_AFTER_RESTARTS", "3"))
+ALERT_WINDOW_SECONDS = int(os.environ.get("BW_ALERT_WINDOW", "3600"))
+
+# Dead man's switch: a healthchecks.io check URL (or any service using the same
+# scheme: GET <url> = alive, POST <url>/fail = failed). The listener pings it
+# every HEALTHCHECK_INTERVAL seconds, but only while the mic hears sound, so
+# the monitor alerts you when pings stop for longer than its grace period: the
+# machine is off, asleep or stuck at the sign-in screen, the network is down,
+# or the mic stays dead. Empty = off.
+HEALTHCHECK_URL = os.environ.get("BW_HEALTHCHECK_URL", "").strip()
+HEALTHCHECK_INTERVAL = int(os.environ.get("BW_HEALTHCHECK_INTERVAL", "300"))

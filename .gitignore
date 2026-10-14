@@ -8,3 +8,11 @@ clips/
 .serena/
 .env
 listener.log
+listener.log.1
+listener.heartbeat
+listener.lock
+watchdog.log
+watchdog.lock
+watchdog.stop
+outbox.jsonl
+outbox.jsonl.tmp

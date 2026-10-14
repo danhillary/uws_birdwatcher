@@ -50,6 +50,16 @@ def get_engine():
             config.database_url(),
             pool_pre_ping=True,
             future=True,
+            # Fail fast when the network is down rather than stalling the
+            # listener for the OS's ~20 s connect timeout, and notice a
+            # silently dropped connection instead of waiting on it forever.
+            connect_args={
+                "connect_timeout": 10,
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 3,
+            },
         )
     return _engine
 
