@@ -1,5 +1,7 @@
 # uws_birdwatcher
 
+![Listener status](https://healthchecks.io/badge/ecc7da1d-2e3a-4faa-ad73-ab5ccc/4fWMRb2c-2.svg)
+
 Point a microphone out the window, identify the birds you hear with
 [BirdNET](https://github.com/kahst/BirdNET-Analyzer) (Cornell Lab), and show them
 on a live dashboard — **The Ramble Register**.
@@ -164,7 +166,9 @@ its ping URL in `.env` and send a test ping:
 ```
 
 Restart the listener (`python -m capture.watchdog --stop`, then run
-`run_listener.vbs`) to pick it up.
+`run_listener.vbs`) to pick it up. The status badge at the top of this README
+is that check's healthchecks.io badge: green while pings arrive, red once the
+check is down.
 
 ## Dashboard
 
