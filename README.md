@@ -84,8 +84,10 @@ The listener needs the microphone, which is tied to your interactive Windows
 session — so run it as a **scheduled task in your user session**, not as a
 Windows Service (Session 0 services can't reach the mic).
 
-`run_listener.vbs` (in the repo root) starts the listener hidden and appends its
-output to `listener.log`. Double-click it to start now, or autostart it on logon:
+`run_listener.vbs` (in the repo root) starts the listener hidden, supervised by
+a watchdog (see *Self-recovery and alerts* below). The listener's output goes to
+`listener.log` and the watchdog's restart history to `watchdog.log`.
+Double-click it to start now, or autostart it on logon:
 
 1. Open **Task Scheduler** → **Create Task…** (not "Basic Task").
 2. **General:** name it "Birdwatcher listener"; select **Run only when user is
@@ -93,19 +95,76 @@ output to `listener.log`. Double-click it to start now, or autostart it on logon
 3. **Triggers:** New → **At log on** → (optionally your user). Tick **Enabled**.
 4. **Actions:** New → Program/script: `wscript.exe`; Add arguments:
    `"C:\path\to\uws_birdwatcher\run_listener.vbs"`.
-5. **Settings:** tick **If the task fails, restart every 1 minute** and **If the
-   running task does not end when requested, force it to stop**; untick **Stop
-   the task if it runs longer than…** so it runs indefinitely.
-6. Save. It launches at every logon; check `listener.log` to confirm detections.
+5. **Settings:** untick **Stop the task if it runs longer than…**. (Task
+   Scheduler's "restart if the task fails" does nothing here: the .vbs returns
+   at once, so the task always looks successful. The watchdog does the
+   restarting.) On **Conditions**, untick **Start the task only if the computer
+   is on AC power**, or a laptop on battery at logon won't start it.
+6. Optional extra safety: add a second trigger, **Daily**, repeating every
+   **10 minutes** indefinitely. If the watchdog itself ever dies, this brings
+   it back; while it's running, extra launches exit at once.
+7. Save. It launches at every logon; check `listener.log` to confirm detections.
 
-To check it's running: Task Manager → Details → look for `python.exe`. To stop
-it: end that `python.exe` (or disable the task). Also set **Power & sleep** so
-the desktop doesn't sleep, or it stops recording.
+To check it's running: `watchdog.log` should end with "listener started", and
+Task Manager → Details shows `python.exe` processes for `capture.watchdog` and
+`capture.listen`. To stop it:
+
+```bash
+.venv\Scripts\python -m capture.watchdog --stop
+```
+
+(Ending only the listener's `python.exe` just makes the watchdog restart it.)
+Also set **Power & sleep** so the desktop doesn't sleep, or it stops recording.
 
 > Want it running *before* you log in (e.g. headless reboots)? Either enable
 > Windows auto-login for that account, or use a tool like
 > [NSSM](https://nssm.cc/) to run it as a service — but verify the service can
-> actually access the mic, since Session 0 often can't.
+> actually access the mic, since Session 0 often can't. This matters: on Oct
+> 14, 2026 a Windows Update restart at 01:29 left the machine at the sign-in
+> screen, and nothing recorded until someone signed in at 12:36.
+
+### Self-recovery and alerts
+
+The listener used to stop for good on the first unexpected error. On Oct 13,
+2026 the network dropped at 23:51, a detection arrived while the database was
+unreachable, and the unguarded insert killed it. Now recovery has three layers,
+and you hear about an outage only when all of them fail:
+
+1. **Inside the listener.** Database and network errors are never fatal:
+   detections wait in a local outbox (`outbox.jsonl`) and are written once the
+   database is back, and the database is retried once a minute rather than
+   every segment. A mic that stays silent or errors for four segments (about a
+   minute) is reopened: PortAudio is restarted and the device found again by
+   name, which is what a USB dropout or driver reset needs. A recording that
+   never finishes is abandoned after 35 s rather than blocking forever. If the
+   mic is still dead after 10 minutes of reopening, the listener exits with
+   code 3 so a fresh process can try.
+2. **The watchdog** (`capture/watchdog.py`, started by `run_listener.vbs`)
+   restarts the listener whenever it exits, waiting 5 s and doubling up to 5
+   minutes if it keeps failing. It also kills and restarts a listener whose
+   heartbeat file (`listener.heartbeat`, touched every segment) has gone stale
+   for 3 minutes. A lock stops a second listener or watchdog from starting.
+3. **Alerts (dead man's switch).** Set `BW_HEALTHCHECK_URL` to a
+   [healthchecks.io](https://healthchecks.io) check (free; or a self-hosted
+   instance). The listener pings it every 5 minutes, but only while the mic is
+   hearing sound. If the pings stop for longer than the check's grace period
+   (the machine is off, asleep or at the sign-in screen, the network is down,
+   or the mic stays dead), healthchecks.io notifies you by email, push or SMS,
+   and again when pings resume. The watchdog also reports a failure straight
+   away, with the end of the log, after 3 restarts within an hour. Outages that
+   fix themselves within the grace period never notify you.
+
+To set up alerts: create a check at healthchecks.io with **period 5 minutes**
+and **grace 30 minutes**, add the notification channels you want, then put
+its ping URL in `.env` and send a test ping:
+
+```bash
+# .env:  BW_HEALTHCHECK_URL=https://hc-ping.com/your-check-uuid
+.venv\Scripts\python -m healthcheck
+```
+
+Restart the listener (`python -m capture.watchdog --stop`, then run
+`run_listener.vbs`) to pick it up.
 
 ## Dashboard
 
@@ -383,6 +442,15 @@ variables:
 | `BW_DISPUTED_THRESHOLD` | `-3`           | Net clip-vote score at/below which a detection is flagged "Disputed" |
 | `BW_FILTER_REFRESH` | `120`              | Seconds between the listener's recomputes of the stored false-positive flags (`0` = off) |
 | `BW_ADMIN_PASSWORD` | *(empty)*          | Passphrase for the dashboard's filter admin controls; empty = no admin controls |
+| `BW_HEALTHCHECK_URL` | *(empty)*         | healthchecks.io ping URL for outage alerts; empty = off |
+| `BW_HEALTHCHECK_INTERVAL` | `300`        | Seconds between "alive" pings (sent only while the mic hears sound) |
+| `BW_MIC_REOPEN_AFTER` | `4`              | Consecutive silent/failed segments before the mic is reopened |
+| `BW_MIC_GIVE_UP`    | `600`              | Seconds of a dead mic, despite reopening, before the listener restarts itself |
+| `BW_HANG_SECONDS`   | `180`              | Seconds without a heartbeat before the watchdog kills and restarts the listener |
+| `BW_ALERT_AFTER_RESTARTS` | `3`          | Restarts within `BW_ALERT_WINDOW` that trigger the watchdog's failure alert |
+| `BW_ALERT_WINDOW`   | `3600`             | Window, in seconds, for counting restarts |
+| `BW_DB_RETRY`       | `60`               | Seconds to skip the database after an error (detections queue in the outbox) |
+| `BW_OUTBOX_PATH`    | `outbox.jsonl`     | Where detections wait while the database is unreachable |
 
 Example (PowerShell): `$env:BW_INPUT_DEVICE="UAC"; .venv\Scripts\python -m capture.listen`
 
@@ -402,11 +470,15 @@ bird_profile.py        # per-bird profile analytics (pure pandas, no DB)
 acoustics.py           # clip spectrograms + pitch signatures (numpy only)
 storage.py             # clip saving + storage-cap pruning
 feed.py                # publishes the iPhone-widget JSON feed to S3 (optional)
+outbox.py              # queues detections locally while the database is unreachable
+healthcheck.py         # dead man's switch pings + failure alerts (optional)
 clips_s3.py            # uploads detection clips to S3 for cloud playback (optional)
 streamlit_app.py       # Streamlit dashboard (also the Connect Cloud primary file)
 capture/
   list_devices.py      # list microphones
   listen.py            # record -> identify -> save to DB + clips
+  watchdog.py          # restarts the listener on crash/hang; alerts if that fails
+  recovery.py          # mic-reopen and restart/alert decisions (unit-tested)
 widget/
   RambleRegister.js    # Scriptable iPhone widget (reads the S3 feed)
 requirements.txt       # slim dashboard deps (Connect Cloud installs these)
@@ -416,6 +488,7 @@ tests/
   test_filters.py      # unit tests for each filter rule
   test_insights.py     # unit tests for the analytics and sun times
   test_bird_profile.py # unit tests for bird profiles and clip acoustics
+  test_recovery.py     # unit tests for the outbox, mic guard and restart policy
 .env.example           # template for DB credentials (copy to .env)
 ```
 
