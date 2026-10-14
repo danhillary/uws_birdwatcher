@@ -18,6 +18,7 @@ import urllib.request
 import config
 
 _last_ok = float("-inf")
+_confirmed = False
 
 
 def _send(url, body=None):
@@ -41,10 +42,15 @@ def ok_safe():
     _last_ok = now
 
     def run():
+        global _confirmed
         try:
             _send(config.HEALTHCHECK_URL)
         except Exception as e:
             print(f"   (health ping failed: {e})")
+            return
+        if not _confirmed:  # say so once per run, so the log shows alerts are armed
+            _confirmed = True
+            print("   (health ping delivered; outage alerts are armed)")
 
     threading.Thread(target=run, name="health-ping", daemon=True).start()
 
