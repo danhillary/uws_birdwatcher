@@ -15,16 +15,26 @@ mic stays dead for BW_MIC_GIVE_UP seconds it exits with code 3 so the watchdog
 Run with:  python -m capture.listen   (or supervised: python -m capture.watchdog)
 Stop with: Ctrl-C
 """
+import faulthandler
 import os
 import socket
 import sys
 import time
 
+import config
+
+# If startup or a loop stalls long enough for the watchdog to kill us, dump
+# every thread's stack to the log first, so a hang says where it was stuck.
+# (Some Oct 14 restarts hung before printing anything.) Startup gets most of
+# the watchdog's first-heartbeat allowance; touch_heartbeat() re-arms it with
+# a shorter fuse each loop. It's armed before the remaining imports because
+# importing sounddevice starts PortAudio, which can block on a wedged device.
+faulthandler.dump_traceback_later(240)
+
 import numpy as np
 import sounddevice as sd
 
 import clips_s3
-import config
 import db
 import feed
 import filter_refresh
@@ -137,6 +147,7 @@ def db_call(what, fn, **kwargs):
 
 def touch_heartbeat():
     """Tell the watchdog we're still making progress (a local file, no network)."""
+    faulthandler.dump_traceback_later(max(30, config.HANG_SECONDS - 30))
     try:
         with open(config.HEARTBEAT_PATH, "w") as f:
             f.write(f"{time.time():.0f}\n")
