@@ -146,15 +146,12 @@ def publish(feed=None):
     upload fails — callers in the listener loop should use publish_safe()."""
     if not config.FEED_S3_BUCKET:
         raise RuntimeError("BW_FEED_S3_BUCKET is not set; feed is disabled.")
-    import boto3  # imported lazily so the dashboard never needs the dependency
+    import clips_s3  # its client has short timeouts, so a slow network can't stall the listener
 
     feed = feed if feed is not None else build_feed()
     body = json.dumps(feed, default=str).encode("utf-8")
 
-    client_kwargs = {}
-    if config.FEED_S3_REGION:
-        client_kwargs["region_name"] = config.FEED_S3_REGION
-    s3 = boto3.client("s3", **client_kwargs)
+    s3 = clips_s3._client()
 
     put_kwargs = {
         "Bucket": config.FEED_S3_BUCKET,
