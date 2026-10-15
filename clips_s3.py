@@ -36,8 +36,14 @@ def _public_url(key):
 
 def _client():
     import boto3  # imported lazily so the dashboard never needs the dependency
+    from botocore.config import Config
 
-    kwargs = {}
+    # boto3's defaults (60 s connect + 60 s read, several retries) can stall
+    # the capture loop for minutes on a flaky network, long enough for the
+    # watchdog to kill the listener as hung (Oct 14). Fail fast instead: a clip
+    # whose upload fails falls back to local disk for the backfill tool.
+    kwargs = {"config": Config(connect_timeout=5, read_timeout=15,
+                               retries={"max_attempts": 1, "mode": "standard"})}
     if config.FEED_S3_REGION:
         kwargs["region_name"] = config.FEED_S3_REGION
     return boto3.client("s3", **kwargs)
