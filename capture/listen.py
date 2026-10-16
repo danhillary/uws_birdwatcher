@@ -2,22 +2,23 @@
 
 Captures fixed-length audio segments, runs BirdNET on each (filtered to species
 likely at your location/date), then for every detection: prints it, saves a
-short audio clip, and stores a row in the database. Old clips are pruned to stay
-under the configured storage cap. A background thread recomputes the
-false-positive filter flags every BW_FILTER_REFRESH seconds.
+short audio clip and queues the detection in the local outbox. Recording is
+local-first: this loop never touches the network. A background sync thread
+(uploader.py) uploads clips to S3, writes detections to the database and
+deletes the uploaded local clips, so a network or database outage only grows
+the backlog. Local clips are pruned to stay under BW_MAX_CLIPS_MB. Another
+background thread recomputes the false-positive filter flags every
+BW_FILTER_REFRESH seconds.
 
-Faults that used to stop it are survived: a database or network outage queues
-detections in a local outbox until the database is back, and a mic that goes
-silent or errors is reopened (PortAudio restarted, device found again). If the
-mic stays dead for BW_MIC_GIVE_UP seconds it exits with code 3 so the watchdog
-(capture/watchdog.py) can start a fresh process.
+A mic that goes silent or errors is reopened (PortAudio restarted, device found
+again). If it stays dead for BW_MIC_GIVE_UP seconds the listener exits with
+code 3 so the watchdog (capture/watchdog.py) can start a fresh process.
 
 Run with:  python -m capture.listen   (or supervised: python -m capture.watchdog)
 Stop with: Ctrl-C
 """
 import faulthandler
 import os
-import socket
 import sys
 import time
 
@@ -35,12 +36,11 @@ import numpy as np
 import sounddevice as sd
 
 import clips_s3
-import db
-import feed
 import filter_refresh
 import healthcheck
 import outbox
 import storage
+import uploader
 from analysis import BirdAnalyzer, dedupe_per_species, partition_detections
 from capture.recovery import EXIT_MIC, MicGuard
 
@@ -122,29 +122,6 @@ def reopen_mic():
     return open_mic()
 
 
-_db_retry_at = 0.0
-
-
-def db_call(what, fn, **kwargs):
-    """Run a database call from the capture loop; True if it succeeded.
-
-    Never raises. After a failure the database is skipped for BW_DB_RETRY
-    seconds, so a dead connection costs one connect timeout a minute rather
-    than one per segment."""
-    global _db_retry_at
-    if time.monotonic() < _db_retry_at:
-        return False
-    try:
-        fn(**kwargs)
-        return True
-    except Exception as e:
-        msg = str(e).strip()
-        first = msg.splitlines()[0] if msg else type(e).__name__
-        print(f"   ({what} failed: {first}; retrying in {config.DB_RETRY_SECONDS}s)")
-        _db_retry_at = time.monotonic() + config.DB_RETRY_SECONDS
-        return False
-
-
 def touch_heartbeat():
     """Tell the watchdog we're still making progress (a local file, no network)."""
     faulthandler.dump_traceback_later(max(30, config.HANG_SECONDS - 30))
@@ -202,10 +179,10 @@ def main():
         print(f"Audio device error: {e}")
         return 1
 
-    # An unreachable database no longer stops the listener: detections queue
-    # in the outbox and setup is retried every loop until it succeeds.
-    db_ready = db_call("database setup", db.init_db)
     storage.ensure_dirs()
+    # Database setup, uploads, heartbeat and feed all happen on the sync
+    # thread; recording starts without waiting for any of them.
+    uploader.start()
 
     print("Loading BirdNET model (first run downloads/initialises, ~10-20s)...")
     analyzer = BirdAnalyzer()
@@ -229,13 +206,7 @@ def main():
     # round trip never costs recorded audio.
     filter_refresh.start_background()
 
-    host = socket.gethostname()
-    last_det = None  # time of the most recent detection, for the heartbeat
     mic = MicGuard(config.MIC_REOPEN_AFTER, config.MIC_GIVE_UP_SECONDS)
-
-    def replay_outbox():
-        n = outbox.flush(db.insert_detection)
-        print(f"   (database back: wrote {n} queued detection(s))")
 
     try:
         while True:
@@ -246,24 +217,14 @@ def main():
                 print(f"[{config.now_local():%H:%M:%S}] (mic error: {e})")
                 audio, peak = None, 0.0
             touch_heartbeat()
-
-            if not db_ready:
-                db_ready = db_call("database setup", db.init_db)
-            if db_ready and outbox.pending():
-                db_call("outbox replay", replay_outbox)
-
-            # Heartbeat: let the dashboard see we're alive and what the mic is
-            # hearing, even during long silent stretches.
-            if db_ready:
-                db_call("heartbeat write", db.record_heartbeat,
-                        host=host, last_peak=peak, last_detection_at=last_det)
-
-            # Refresh the public widget feed (throttled, no-op if disabled).
-            feed.publish_safe()
+            uploader.state["peak"] = peak  # the sync thread's dashboard heartbeat
 
             action = mic.check(peak >= 1e-4)
             if action == "ok":
-                healthcheck.ok_safe()
+                # Alive = hearing sound *and* syncing; if sync stays broken the
+                # pings stop and you're alerted, though recording continues.
+                if uploader.healthy():
+                    healthcheck.ok_safe()
             else:
                 if audio is not None:
                     print(f"[{config.now_local():%H:%M:%S}] (silence — check the mic)")
@@ -299,53 +260,35 @@ def main():
                 continue
 
             for d in detections:
-                if has_voice:
-                    # Privacy hold: keep this clip on the recording machine only,
-                    # never on the public bucket.
-                    clip = storage.save_clip(
-                        audio, config.SAMPLE_RATE, when,
-                        d["common_name"], d["start_time"], d["end_time"],
-                    )
-                    clip_url = None
-                else:
-                    # Bird clips live in S3 only — encode in memory and upload,
-                    # writing local disk only if the upload fails, so the clip
-                    # isn't lost and the backfill tool can retry it later.
-                    filename = storage.clip_filename(when, d["common_name"])
-                    data = storage.encode_clip(
-                        audio, config.SAMPLE_RATE,
-                        d["start_time"], d["end_time"],
-                    )
-                    clip_url = clips_s3.upload_bytes(filename, data)
-                    clip = None if clip_url else storage.save_clip(
-                        audio, config.SAMPLE_RATE, when,
-                        d["common_name"], d["start_time"], d["end_time"],
-                    )
-                row = dict(
+                # Local first: save the clip and queue the detection; the sync
+                # thread uploads and writes it. Human-voice clips are a privacy
+                # hold: they stay on this machine and never go to the bucket.
+                clip = storage.save_clip(
+                    audio, config.SAMPLE_RATE, when,
+                    d["common_name"], d["start_time"], d["end_time"],
+                )
+                outbox.add(dict(
                     detected_at=when, common_name=d["common_name"],
                     scientific_name=d["scientific_name"],
                     confidence=float(d["confidence"]),
                     lat=config.LATITUDE, lon=config.LONGITUDE,
-                    clip_path=clip, clip_url=clip_url,
-                )
-                # Database down? Queue it locally instead of losing it (this
-                # insert, unguarded, is what crashed the listener on Oct 13).
-                if not (db_ready and db_call("detection write",
-                                             db.insert_detection, **row)):
-                    outbox.add(row)
+                    clip_path=clip, clip_url=None,
+                    upload_clip=clips_s3.enabled() and not has_voice,
+                ))
                 print(
                     f"[{stamp}] \U0001F426 {d['common_name']} "
                     f"({d['scientific_name']}) — {d['confidence']:.0%}  "
-                    f"-> {clip_url or clip or 'S3'}"
+                    f"-> {clip}{' (kept local)' if has_voice else ''}"
                 )
-                last_det = when
+                uploader.state["last_det"] = when
+            uploader.wake()
 
-            # Keep the *local* clip cache (human-voice holds + any upload
-            # fallbacks) under the cap, and forget pruned files in the DB. S3
-            # copies are permanent and never pruned.
+            # Keep local clips (upload backlog, human-voice holds, failed-upload
+            # fallbacks) under the cap; the sync thread clears clip_path for
+            # pruned files. S3 copies are permanent and never pruned.
             removed = storage.prune_to_cap()
             if removed:
-                db_call("clip cleanup", db.clear_clip_paths, filenames=removed)
+                uploader.forget_clips(removed)
                 print(f"   (pruned {len(removed)} local clip(s) to stay under "
                       f"{config.MAX_CLIPS_MB} MB)")
     except KeyboardInterrupt:

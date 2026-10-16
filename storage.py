@@ -1,11 +1,10 @@
-"""Audio-clip encoding, local saving, and storage-cap pruning.
+"""Audio-clip saving and storage-cap pruning.
 
-Bird clips live in S3 only — the listener encodes them in memory (``encode_clip``)
-and uploads straight to the bucket, never writing local disk. ``save_clip`` is
-the local-disk path, used only for the clips that *can't* go to the public
-bucket: human-voice holds (privacy) and any clip whose S3 upload failed (kept on
-disk so the backfill tool can retry it)."""
-import io
+Recording is local-first: the listener saves every clip to CLIPS_DIR with
+``save_clip``. Bird clips wait there only until the sync thread (uploader.py)
+has uploaded them to S3, then are deleted; human-voice holds (privacy) stay,
+as do clips whose upload kept failing (for the backfill tool). ``prune_to_cap``
+keeps the folder under BW_MAX_CLIPS_MB whatever happens."""
 import os
 import re
 
@@ -21,8 +20,7 @@ def ensure_dirs():
 
 
 def clip_filename(when, common_name):
-    """The clip's filename (used as both the local name and the S3 key leaf).
-    Deterministic, so encode_clip and save_clip agree on the same name."""
+    """The clip's filename (used as both the local name and the S3 key leaf)."""
     safe_name = _SAFE.sub("_", common_name).strip("_") or "bird"
     return f"{when:%Y%m%dT%H%M%S}_{safe_name}.wav"
 
@@ -35,20 +33,12 @@ def _slice(audio, sample_rate, start_time, end_time):
     return audio[start:end] if end > start else audio
 
 
-# 16-bit PCM (not the float32 default): half the size and playable in every
-# browser, which matters now that clips are served to the web dashboard.
-def encode_clip(audio, sample_rate, start_time, end_time):
-    """Encode the detection's clip as in-memory WAV bytes, for direct upload to
-    S3 with no local file written."""
-    buf = io.BytesIO()
-    sf.write(buf, _slice(audio, sample_rate, start_time, end_time), sample_rate,
-             format="WAV", subtype="PCM_16")
-    return buf.getvalue()
-
-
 def save_clip(audio, sample_rate, when, common_name, start_time, end_time):
     """Write the detection's clip to a WAV in CLIPS_DIR. Returns the filename
-    (not full path), suitable for the DB's clip_path."""
+    (not full path), suitable for the DB's clip_path.
+
+    16-bit PCM (not the float32 default): half the size and playable in every
+    browser, which matters because clips are served to the web dashboard."""
     filename = clip_filename(when, common_name)
     sf.write(os.path.join(config.CLIPS_DIR, filename),
              _slice(audio, sample_rate, start_time, end_time), sample_rate,
@@ -72,9 +62,10 @@ def prune_to_cap():
     """Delete oldest *local* clips until the directory is under MAX_CLIPS_MB.
     Returns the list of deleted filenames so the DB can be updated.
 
-    Only human-voice holds and failed-upload fallbacks live on disk now (bird
-    clips go straight to S3), so this just bounds that small local cache. The S3
-    copies are permanent — they are never pruned."""
+    Normally the folder holds only human-voice holds, failed-upload fallbacks
+    and a few clips waiting for upload. During a long outage the upload backlog
+    grows too; past the cap its oldest clips go (their detections are still
+    written, without audio). The S3 copies are permanent and never pruned."""
     if config.MAX_CLIPS_MB <= 0:
         return []
     cap_bytes = config.MAX_CLIPS_MB * 1024 * 1024

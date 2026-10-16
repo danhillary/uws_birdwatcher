@@ -132,11 +132,9 @@ The listener used to stop for good on the first unexpected error. On Oct 13,
 unreachable, and the unguarded insert killed it. Now recovery has three layers,
 and you hear about an outage only when all of them fail:
 
-1. **Inside the listener.** Database and network errors are never fatal:
-   detections wait in a local outbox (`outbox.jsonl`) and are written once the
-   database is back, and the database is retried once a minute rather than
-   every segment. A mic that stays silent or errors for four segments (about a
-   minute) is reopened: PortAudio is restarted and the device found again by
+1. **Inside the listener.** Recording is local-first (see *Local-first
+   recording* below), so network and database trouble can't stop it. A mic
+   that stays silent or errors for four segments (about a minute) is reopened: PortAudio is restarted and the device found again by
    name, which is what a USB dropout or driver reset needs. A recording that
    never finishes is abandoned after 35 s rather than blocking forever. If the
    mic is still dead after 10 minutes of reopening, the listener exits with
@@ -165,8 +163,11 @@ its ping URL in `.env` and send a test ping:
 .venv\Scripts\python -m healthcheck
 ```
 
-Restart the listener (`python -m capture.watchdog --stop`, then run
-`run_listener.vbs`) to pick it up. The status badge at the top of this README
+Restart the listener to pick it up: `python -m capture.watchdog --stop`,
+then start the scheduled task (Task Scheduler → *birdwatcher* → **Run**, or
+`Start-ScheduledTask -TaskName birdwatcher` in PowerShell). Start it that way
+rather than from a terminal or an app, so it doesn't stop when that app
+closes or updates. The status badge at the top of this README
 is that check's healthchecks.io badge: green while pings arrive, red once the
 check is down.
 
@@ -220,10 +221,47 @@ a dead one.
 The listener and dashboard share the same database, so the dashboard updates as
 new birds are detected. **Clip playback in the cloud** requires the clips to be
 reachable from the dashboard host: when the S3 feed bucket is configured (see
-below), the listener uploads each bird clip there — straight from memory, so it
-lives in S3 only and never on local disk — and the dashboard plays it from a
-public URL. Without a bucket (or with `BW_PUBLISH_CLIPS=0`), clips fall back to
+below), the listener uploads each bird clip there, deletes its local copy (see
+*Local-first recording*), and the dashboard plays it from a public URL. Without a bucket (or with `BW_PUBLISH_CLIPS=0`), clips fall back to
 local files on the recording machine, where playback still works.
+
+### Local-first recording
+
+The capture loop never touches the network. For every detection it saves the
+clip to `clips/` and appends the detection, with the time it was heard, to a
+local queue (`outbox.jsonl`). A background sync thread (`uploader.py`) does
+everything that needs a connection: it uploads each bird clip to S3, writes the
+detection to the database, deletes the local clip, and keeps the dashboard
+heartbeat and phone-widget feed up to date. When the network or database is
+down, only the sync thread waits; recording carries on and the backlog drains,
+oldest first, when the connection returns. During an outage the dashboard shows
+the listener as offline; afterwards the missed detections appear with their
+real times.
+
+This came out of Oct 15, 2026, when the listener sat behind a stuck database
+lock from 17:25 to 19:49 and recorded nothing. The database connections now
+also carry their own limits: a lock wait gives up after 10 s, a statement after
+60 s, and an abandoned transaction is ended after 5 minutes (it used to hold
+its locks for the server's 2-hour dead-client timeout). Startup no longer runs
+schema changes when nothing is missing, so it takes no heavy locks.
+
+If a clip's upload keeps failing while the database works, its detection waits
+up to 30 minutes (`BW_CLIP_UPLOAD_GIVE_UP`), then is written with the clip
+kept locally for `python -m backfill_clips`. If the sync thread can't reach the
+database for 15 minutes (`BW_SYNC_STALE`), health pings stop, so a sync that
+stays broken alerts you even though recording continues.
+
+**Local disk use is capped,** so a long outage can't fill the disk:
+
+| What | Cap | When it's full |
+|------|-----|----------------|
+| `clips/` | `BW_MAX_CLIPS_MB` (2,000 MB) | Oldest local clips are deleted, including any still waiting to upload; their detections are still saved, without audio |
+| `outbox.jsonl` | `BW_OUTBOX_MAX_MB` (50 MB, over 100,000 detections) | Oldest queued detections are dropped |
+| `listener.log` | 50 MB, plus one 50 MB `listener.log.1` | Rolled over when the listener (re)starts |
+
+Uploaded bird clips are deleted locally as soon as they're in S3, so normally
+`clips/` holds only human-voice holds and failed-upload fallbacks (2,000 MB is
+roughly 4,000 clips).
 
 ### Privacy: human voices are kept out of the cloud
 
@@ -407,7 +445,7 @@ writes to the shared PostgreSQL database; the cloud-hosted dashboard reads from
 that same database, so detections recorded at home appear online. A freshly
 deployed dashboard renders but stays empty until the listener records something.
 Bird-clip playback works in the cloud once an S3 bucket is configured (clips are
-uploaded there and never written to local disk); otherwise playback is
+uploaded there and their local copies deleted); otherwise playback is
 local-only. See the iPhone-widget section for the bucket setup.
 
 ## Configuration
@@ -433,7 +471,7 @@ variables:
 | `BW_DB_SCHEMA`      | `birdwatcher`      | Schema holding the detections table            |
 | `BW_TIMEZONE`       | `America/New_York` | Local TZ for "today"/hourly buckets            |
 | `BW_CLIPS_DIR`      | `clips/`           | Local cache for clips not on S3 (voice holds, upload fallbacks) |
-| `BW_MAX_CLIPS_MB`   | `2000`             | Local clip-cache cap; oldest local clips pruned over it (S3 never pruned) |
+| `BW_MAX_CLIPS_MB`   | `2000`             | Disk cap for local clips (upload backlog, voice holds, fallbacks); oldest pruned over it (S3 never pruned) |
 | `BW_FEED_S3_BUCKET` | *(empty)*          | S3 bucket for the iPhone-widget feed; empty = off |
 | `BW_FEED_S3_KEY`    | `birdwatcher/latest.json` | S3 key for the published JSON feed      |
 | `BW_FEED_S3_REGION` | *(empty)*          | AWS region for the feed bucket                 |
@@ -453,8 +491,11 @@ variables:
 | `BW_HANG_SECONDS`   | `180`              | Seconds without a heartbeat before the watchdog kills and restarts the listener |
 | `BW_ALERT_AFTER_RESTARTS` | `3`          | Restarts within `BW_ALERT_WINDOW` that trigger the watchdog's failure alert |
 | `BW_ALERT_WINDOW`   | `3600`             | Window, in seconds, for counting restarts |
-| `BW_DB_RETRY`       | `60`               | Seconds to skip the database after an error (detections queue in the outbox) |
-| `BW_OUTBOX_PATH`    | `outbox.jsonl`     | Where detections wait while the database is unreachable |
+| `BW_DB_RETRY`       | `60`               | Seconds the sync thread skips the database after an error |
+| `BW_OUTBOX_PATH`    | `outbox.jsonl`     | Local queue of detections waiting to sync |
+| `BW_OUTBOX_MAX_MB`  | `50`               | Disk cap for the queue; oldest rows dropped over it |
+| `BW_CLIP_UPLOAD_GIVE_UP` | `1800`        | Seconds a detection waits for its failing clip upload before it's written with the clip kept locally |
+| `BW_SYNC_STALE`     | `900`              | Seconds without reaching the database before health pings stop |
 
 Example (PowerShell): `$env:BW_INPUT_DEVICE="UAC"; .venv\Scripts\python -m capture.listen`
 
@@ -474,7 +515,8 @@ bird_profile.py        # per-bird profile analytics (pure pandas, no DB)
 acoustics.py           # clip spectrograms + pitch signatures (numpy only)
 storage.py             # clip saving + storage-cap pruning
 feed.py                # publishes the iPhone-widget JSON feed to S3 (optional)
-outbox.py              # queues detections locally while the database is unreachable
+outbox.py              # local queue every detection goes through before the database
+uploader.py            # sync thread: clips to S3, rows to the DB, local cleanup
 healthcheck.py         # dead man's switch pings + failure alerts (optional)
 clips_s3.py            # uploads detection clips to S3 for cloud playback (optional)
 streamlit_app.py       # Streamlit dashboard (also the Connect Cloud primary file)
@@ -493,6 +535,7 @@ tests/
   test_insights.py     # unit tests for the analytics and sun times
   test_bird_profile.py # unit tests for bird profiles and clip acoustics
   test_recovery.py     # unit tests for the outbox, mic guard and restart policy
+  test_uploader.py     # unit tests for the sync step (upload, insert, cleanup)
 .env.example           # template for DB credentials (copy to .env)
 ```
 
@@ -511,10 +554,9 @@ tests/
   listener runs in the background and writes to the shared database, so home
   detections appear online — the **data bridge** is live end-to-end ✅.
 - **Phase 6 (done)** — cloud audio storage on S3 so clip playback works from the
-  hosted dashboard, not just the recording machine ✅. Bird clips are uploaded
-  straight from memory and live in **S3 only** (never written to local disk) and
-  are never pruned from the bucket; only human-voice holds and failed-upload
-  fallbacks are kept locally ✅.
+  hosted dashboard, not just the recording machine ✅. Bird clips end up in **S3
+  only** (deleted locally once uploaded) and are never pruned from the bucket;
+  only human-voice holds and failed-upload fallbacks are kept locally ✅.
 - **Phase 7 (done)** — false-positive filters: four shape tests flag likely
   false positives without deleting them; Filtered/Raw and per-test switches on
   every view; a Filter report tab with per-species summary and removed

@@ -3,9 +3,10 @@
 A host that only runs the dashboard (Posit Connect Cloud) has no access to the
 recording machine's disk. So the listener uploads each bird clip to the same
 public S3 bucket the iPhone feed uses and stores the public URL on the detection
-row; the dashboard plays straight from the URL. Bird clips live in S3 *only* —
-the listener uploads them from memory (``upload_bytes``) without ever writing
-local disk — and they are never deleted from the bucket.
+row; the dashboard plays straight from the URL. The listener saves each clip
+locally first; its sync thread (uploader.py) uploads it with ``put`` and then
+deletes the local copy, so bird clips end up in S3 only. They are never deleted
+from the bucket.
 
 The whole feature is a no-op unless ``BW_FEED_S3_BUCKET`` is set and
 ``BW_PUBLISH_CLIPS`` is on. Clips containing a human voice are never uploaded —
@@ -49,37 +50,34 @@ def _client():
     return boto3.client("s3", **kwargs)
 
 
-def _put(filename, body):
-    """Put one clip body to S3 under its key and return the public URL, or None.
-
-    Best-effort: any error is swallowed (and logged) so an S3 hiccup never
-    disturbs the capture loop — the detection is still recorded, just without a
-    cloud-playable URL."""
-    if not enabled():
-        return None
+def put(filename, body):
+    """Put one clip body to S3 under its key and return the public URL.
+    Raises on failure, so the sync thread can retry the clip later."""
     key = _key(filename)
-    try:
-        put_kwargs = {
-            "Bucket": config.FEED_S3_BUCKET,
-            "Key": key,
-            "Body": body,
-            "ContentType": "audio/wav",
-            # Clips are immutable once written, so let the browser cache hard.
-            "CacheControl": "max-age=31536000, immutable",
-        }
-        if config.FEED_S3_ACL:
-            put_kwargs["ACL"] = config.FEED_S3_ACL
-        _client().put_object(**put_kwargs)
-    except Exception as e:
-        print(f"   (clip upload failed: {e})")
-        return None
+    put_kwargs = {
+        "Bucket": config.FEED_S3_BUCKET,
+        "Key": key,
+        "Body": body,
+        "ContentType": "audio/wav",
+        # Clips are immutable once written, so let the browser cache hard.
+        "CacheControl": "max-age=31536000, immutable",
+    }
+    if config.FEED_S3_ACL:
+        put_kwargs["ACL"] = config.FEED_S3_ACL
+    _client().put_object(**put_kwargs)
     return _public_url(key)
 
 
-def upload_bytes(filename, data):
-    """Upload an in-memory clip and return its public URL, or None. Lets the
-    listener store bird clips in S3 only, never touching local disk."""
-    return _put(filename, data)
+def _put(filename, body):
+    """Like put(), but best-effort: returns None when uploads are off or the
+    upload fails (logged), for the backfill tool."""
+    if not enabled():
+        return None
+    try:
+        return put(filename, body)
+    except Exception as e:
+        print(f"   (clip upload failed: {e})")
+        return None
 
 
 def upload(filename, local_path):
