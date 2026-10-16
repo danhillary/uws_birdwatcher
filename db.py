@@ -59,6 +59,15 @@ def get_engine():
                 "keepalives_idle": 30,
                 "keepalives_interval": 10,
                 "keepalives_count": 3,
+                # Server-side limits for our own sessions (the shared server
+                # sets none). On Oct 15 a query blocked on a lock waited for
+                # hours, and a killed listener's session kept its locks for
+                # the server's 2 h 11 min dead-client timeout, blocking every
+                # restart. Now a lock wait gives up after 10 s, a statement
+                # after 60 s, and an abandoned open transaction is ended (and
+                # its locks freed) after 5 minutes.
+                "options": ("-c lock_timeout=10s -c statement_timeout=60s "
+                            "-c idle_in_transaction_session_timeout=5min"),
             },
         )
     return _engine
@@ -70,8 +79,28 @@ def get_conn():
     return get_engine().connect()
 
 
+def _schema_ready(conn):
+    """True when every table, column and index init_db creates already exists.
+
+    Routine starts (every listener restart, every dashboard wake-up) then skip
+    the DDL entirely. That matters because ``ALTER TABLE ... ADD COLUMN IF NOT
+    EXISTS`` takes an ACCESS EXCLUSIVE lock on detections even when there is
+    nothing to add, so it queues behind any open transaction on the table and
+    blocks every reader behind it (Oct 15)."""
+    names = [_TABLE, _STATUS, _VOTES, _FCONFIG, _FLAGS, _SPQ, _OVERRIDE,
+             f'"{_SCHEMA}".idx_bw_detected_at', f'"{_SCHEMA}".idx_bw_common_name']
+    checks = [f"to_regclass(:n{i}) IS NOT NULL" for i in range(len(names))]
+    checks.append("""EXISTS (SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = :schema AND table_name = 'detections'
+                        AND column_name = 'clip_url')""")
+    params = {f"n{i}": n for i, n in enumerate(names)}
+    params["schema"] = _SCHEMA
+    return bool(conn.execute(text("SELECT " + " AND ".join(checks)), params).scalar())
+
+
 def init_db():
-    """Create the schema, table, and indexes if they don't already exist."""
+    """Create the schema, table, and indexes if they don't already exist.
+    Cheap and lock-free when they do (see _schema_ready)."""
     ddl = f"""
     CREATE SCHEMA IF NOT EXISTS "{_SCHEMA}";
     CREATE TABLE IF NOT EXISTS {_TABLE} (
@@ -146,8 +175,9 @@ def init_db():
     )
     """
     with get_engine().begin() as conn:
-        for stmt in filter(str.strip, ddl.split(";")):
-            conn.execute(text(stmt))
+        if not _schema_ready(conn):
+            for stmt in filter(str.strip, ddl.split(";")):
+                conn.execute(text(stmt))
         # Seed every threshold with its default so the table documents them
         # all. Existing values are kept; only descriptions are refreshed.
         conn.execute(

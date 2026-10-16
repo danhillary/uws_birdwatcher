@@ -66,17 +66,19 @@ INPUT_DEVICE = os.environ.get("BW_INPUT_DEVICE") or "UAC"
 # SQLite database file holding every detection.
 DB_PATH = os.environ.get("BW_DB_PATH") or os.path.join(BASE_DIR, "birdwatcher.db")
 
-# Local cache for clips that can't go to the public bucket: human-voice holds
-# and any clip whose S3 upload failed. Bird clips live in S3 only and never land
-# here (see clips_s3 / capture.listen).
+# Local clips: every clip is saved here first. Bird clips are deleted once the
+# sync thread has uploaded them to S3; human-voice holds stay (privacy), as do
+# clips whose upload kept failing (see uploader.py).
 CLIPS_DIR = os.environ.get("BW_CLIPS_DIR") or os.path.join(BASE_DIR, "clips")
 
 # Seconds of padding kept on each side of a detection when saving its clip.
 CLIP_PADDING_SECONDS = float(os.environ.get("BW_CLIP_PADDING", "1.0"))
 
-# Storage cap for the local clips cache, in megabytes. When exceeded, the oldest
-# *local* clips are deleted (detection rows are always kept; S3 copies are never
-# pruned). 0 disables pruning.
+# Disk cap for CLIPS_DIR, in megabytes. When exceeded, the oldest local clips
+# are deleted, including any still waiting to upload after a long outage
+# (detection rows are always kept; S3 copies are never pruned). Together with
+# OUTBOX_MAX_MB and the 2 x 50 MB log rotation, this bounds the listener's
+# local disk use. 0 disables pruning.
 MAX_CLIPS_MB = int(os.environ.get("BW_MAX_CLIPS_MB", "2000"))
 
 # --- Timezone (Phase 5) --------------------------------------------------
@@ -194,13 +196,26 @@ ADMIN_PASSWORD = os.environ.get("BW_ADMIN_PASSWORD", "")
 # (capture/watchdog.py) restarts it if it crashes or stops making progress.
 # You're only alerted when that recovery fails.
 #
-# Detections the database can't take right now wait in this local outbox (one
-# JSON line each) and are replayed once it's reachable again.
+# Recording is local-first: the capture loop saves every detection to this
+# local outbox (one JSON line each) and every clip to CLIPS_DIR, and never
+# touches the network. A background sync thread (uploader.py) uploads the clips
+# to S3, writes the rows to the database and deletes the local clips. During an
+# outage only the backlog grows; it drains when the connection returns.
 OUTBOX_PATH = os.environ.get("BW_OUTBOX_PATH") or os.path.join(BASE_DIR, "outbox.jsonl")
-# After a database error, skip the database for this many seconds (detections
-# go to the outbox meanwhile), so a dead connection doesn't add a connect
-# timeout to every segment.
+# Disk cap for the outbox. A detection is ~300 bytes, so 50 MB holds well over
+# 100,000 (months of outage); past the cap the oldest rows are dropped.
+OUTBOX_MAX_MB = int(os.environ.get("BW_OUTBOX_MAX_MB", "50"))
+# After a database error, the sync thread skips the database for this many
+# seconds, so a dead connection doesn't cost a connect timeout every pass.
 DB_RETRY_SECONDS = int(os.environ.get("BW_DB_RETRY", "60"))
+# While a clip's S3 upload keeps failing, its detection waits in the outbox
+# (so the clip can still go to S3 and be deleted locally). After this long the
+# detection is written anyway, with the clip kept on local disk;
+# `python -m backfill_clips` can upload such clips later.
+CLIP_UPLOAD_GIVE_UP_SECONDS = int(os.environ.get("BW_CLIP_UPLOAD_GIVE_UP", "1800"))
+# If the sync thread hasn't reached the database for this long, health pings
+# stop (even though recording continues), so a sync that stays broken alerts.
+SYNC_STALE_SECONDS = int(os.environ.get("BW_SYNC_STALE", "900"))
 
 # Consecutive silent or failed segments before the listener restarts PortAudio
 # and looks for the mic again (4 x 15 s = one minute).

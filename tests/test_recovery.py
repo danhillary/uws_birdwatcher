@@ -74,6 +74,38 @@ def test_outbox_flush_with_nothing_queued(tmp_path):
     assert outbox.flush(lambda **r: None, str(tmp_path / "none.jsonl")) == 0
 
 
+def test_outbox_keeps_rows_added_during_a_flush(tmp_path):
+    # The capture thread appends while the sync thread is mid-flush.
+    path = str(tmp_path / "outbox.jsonl")
+    outbox.add(_row(1), path)
+    outbox.add(_row(2), path)
+
+    got = []
+
+    def insert(**r):
+        got.append(r["common_name"])
+        if len(got) == 1:
+            outbox.add(_row(3), path)
+
+    assert outbox.flush(insert, path) == 2
+    assert got == ["Bird 1", "Bird 2"]
+    left = []
+    outbox.flush(lambda **r: left.append(r["common_name"]), path)
+    assert left == ["Bird 3"]
+
+
+def test_outbox_cap_drops_oldest_rows(tmp_path):
+    path = str(tmp_path / "outbox.jsonl")
+    for i in range(40):
+        outbox.add(_row(i % 60), path, max_bytes=4000)
+    import os
+    assert os.path.getsize(path) <= 4000
+    got = []
+    outbox.flush(lambda **r: got.append(r["common_name"]), path)
+    assert 0 < len(got) < 40
+    assert got[-1] == "Bird 39"  # newest kept, oldest dropped
+
+
 # --- mic guard ----------------------------------------------------------------
 
 def test_mic_guard_reopens_every_n_bad_segments_then_gives_up():
